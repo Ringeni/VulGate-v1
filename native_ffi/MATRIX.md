@@ -43,10 +43,9 @@ that target.
 
 ## Notes
 
-- 15176 and 97205 coarse patches are pure funchook mounts and are listed in
-  `native_ffi/patches/`.
-- The original 15176 and 97205 DSLs use a controlled Frida fallback because
-  funchook does not reliably relocate those entries.
+- `ffi_run.py` automatically maps 15176 / 97205 / 93479 to the coarse
+  return-only patches listed above, so these use pure funchook, not Frida
+  fallback.
 - 42533 / 60005 / 97205 execute BLOCK but the target function does not map that
   return value to a standard HTTP 500/503.
 - 47360's final HTTP 404 is produced by httpd's ErrorDocument internal

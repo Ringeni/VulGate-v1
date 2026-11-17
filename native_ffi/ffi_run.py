@@ -102,9 +102,24 @@ FRIDA_FALLBACK_SYMBOLS = {
     'ngx_http_copy_filter',
 }
 
+COARSE_REPLACEMENTS = {
+    'CVE-2026-15176': ROOT / 'native_ffi' / 'patches' / 'CVE-2026-15176-coarse.vg',
+    'CVE-2026-97205': ROOT / 'native_ffi' / 'patches' / 'CVE-2026-97205-coarse.vg',
+    'CVE-2026-93479': ROOT / 'runtime' / 'dsl' / 'patches_alt' / 'CVE-2026-93479-rewrite.vg',
+}
+
+
+def _coarse_dsl(dsl_path: Path) -> Path:
+    replacement = COARSE_REPLACEMENTS.get(dsl_path.stem)
+    if replacement is not None and replacement.exists():
+        print('FFI: using coarse return-only patch ', replacement.name, flush=True)
+        return replacement
+    return dsl_path
+
 
 def install(dsl_path: Path, pid: int, bridge: Path, duration: float, target_skip: int = 0) -> dict:
     import frida
+    dsl_path = _coarse_dsl(dsl_path)
     patch = dsl_parser.load(dsl_path)
     if any(mount.symbol in FRIDA_FALLBACK_SYMBOLS for mount in patch.mounts):
         print('FFI: target uses the Frida fallback', flush=True)

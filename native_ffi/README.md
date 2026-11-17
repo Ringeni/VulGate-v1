@@ -50,21 +50,27 @@ python native_ffi/ffi_run.py \
 - 有界 `for` 循环；
 - release build。
 
-## Frida fallback
+## Coarse return-only replacements
 
-`ngx_http_map_uri_to_path` 和 `ngx_http_copy_filter` 上 funchook 不可靠，`ffi_run.py` 对原始 DSL 使用受控 Frida fallback。
-
-如果要求纯 FFI，可使用粗粒度替代：
+`ngx_http_map_uri_to_path` 和 `ngx_http_copy_filter` 上 funchook 不可靠，
+93479 的官方粒度版也会挂住。`ffi_run.py` 会自动把这三个原始 DSL 映射为已验证的
+coarse return-only 版本：
 
 ```text
-native_ffi/patches/CVE-2026-15176-coarse.vg
-  ngx_http_static_handler -> 500
-
-native_ffi/patches/CVE-2026-97205-coarse.vg
-  ngx_http_output_filter -> -1
+CVE-2026-15176 -> native_ffi/patches/CVE-2026-15176-coarse.vg
+CVE-2026-97205 -> native_ffi/patches/CVE-2026-97205-coarse.vg
+CVE-2026-93479 -> runtime/dsl/patches_alt/CVE-2026-93479-rewrite.vg
 ```
 
-这两个版本已验证由 funchook 直接挂载，但粒度比原 patch 粗。
+实测：
+
+```text
+15176 -> ngx_http_static_handler -> 500
+97205 -> ngx_http_output_filter -> -1
+93479 -> ngx_http_rewrite_handler -> 500
+```
+
+代价是语义粒度变粗，但不再需要 Frida fallback。
 
 ## 当前限制
 
