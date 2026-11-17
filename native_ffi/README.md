@@ -75,6 +75,21 @@ The 93479 fine-grained action still hangs; the replacement is a safe coarse
 return at `ngx_http_rewrite_handler`. The 111497 single-hook form combines the
 observer and guard because INT3 supports one trap per entry.
 
+## Local preload verification
+
+`int3_driver.c` loads the bridge and installs an unconditional BLOCK hook at
+`ngx_http_map_uri_to_path` before nginx starts; no Frida is involved.
+
+Real nginx 1.31.6 result:
+
+```text
+/files/file.txt -> 500
+/plain          -> 200
+```
+
+This confirms the INT3 engine handles the entry that funchook, Subhook, and
+Dobby could not replace.
+
 ## Current limits
 
 - x86-64 Linux only;
