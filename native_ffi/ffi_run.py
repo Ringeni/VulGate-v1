@@ -1,7 +1,8 @@
-"""Run a DSL patch through the standalone libffi/funchook bridge.
+"""Run a DSL patch through the standalone INT3 bridge.
 
 Frida is used only to attach to the target and load libvg_ffi.so. All per-hit
-execution is C. Callsite/local currently uses the Frida context fallback.
+execution is C in the INT3/SIGTRAP engine; caller locals are read from the
+saved ucontext.
 """
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Install a libffi/funchook hook and hold it for a benchmark window."""
+"""Install an INT3 Shadow-VM hook and hold it for a benchmark window."""
 import sys, time
 sys.path.insert(0, '/kyz/VulGate-v1')
 import frida
