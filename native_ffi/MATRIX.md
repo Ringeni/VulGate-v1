@@ -41,6 +41,17 @@ that target.
 | loop fixture | 4 iterations, body_calls=0 |
 | bounded loop bound > 256 | compile error |
 
+## INT3 engine checks
+
+| Check | Result |
+|---|---|
+| real nginx, preload driver, `ngx_http_map_uri_to_path` | `/files/file.txt` 500, `/plain` 200 |
+| real brotli worker, `WriteRingBuffer` unconditional | error=-9, produced=0 |
+| real brotli worker, `local("available_in") != 0` | error=-9 |
+| local nginx 1000 requests, 16 curl workers | baseline 1.24 s, INT3 1.28 s |
+
+The nginx and brotli checks use `LD_PRELOAD` drivers, not Frida.
+
 ## Notes
 
 - `ffi_run.py` maps 93479 to its coarse return-only patch and 111497 to a
