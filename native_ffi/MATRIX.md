@@ -41,6 +41,20 @@ that target.
 | loop fixture | 4 iterations, body_calls=0 |
 | bounded loop bound > 256 | compile error |
 
+## INT3 install coverage
+
+All 20 patches install through the INT3 bridge:
+
+```text
+nginx 9:  15176 27654 42055 42533 42945 60005 9256 93479 97205
+httpd 7:  47360 56153 56154 56449 57941 63292 63686 93546
+php 2:    109618 109619
+brotli 1: 111497
+```
+
+`ffi_run.py` maps 93479 to the coarse rewrite patch and 111497 to the
+single-entry form; the rest use the original DSLs.
+
 ## INT3 engine checks
 
 | Check | Result |

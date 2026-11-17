@@ -90,10 +90,24 @@ Real nginx 1.31.6 result:
 This confirms the INT3 engine handles the entry that funchook, Subhook, and
 Dobby could not replace.
 
+## Performance
+
+nginx 1.31.6, BLOCK 42945, 32 threads:
+
+| mode | run 1 RPS | run 2 RPS |
+|---|---:|---:|
+| baseline | 1005.6 | 950.9 |
+| INT3 | 886.0 | 863.4 |
+| Frida | 837.1 | 883.3 |
+
+INT3 is in the same range as Frida; the third load window expired and is not
+used.
+
 ## Current limits
 
 - x86-64 Linux only;
 - SIGTRAP hook adds per-hit signal overhead;
 - 42533 / 60005 / 97205 execute BLOCK but the target function does not map it
   to a standard HTTP 500/503;
-- 20-patch matrix still needs a final rerun on this engine.
+- 20/20 patches install through INT3; the behavior matrix is in
+  `native_ffi/MATRIX.md`.
