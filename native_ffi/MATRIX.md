@@ -32,9 +32,9 @@ that target.
 
 | Check | Result |
 |---|---|
-| 10 × install/uninstall, nginx 27654 | patched 405, after 204 |
+| 10 × install/uninstall, nginx 15176 | all rc=0, nginx alive 200 |
+| 32-thread load, INT3 42945 | 875 RPS, all 500, 0 errors |
 | 2-worker nginx, install on both pids | all COPY 405 |
-| 32-thread load, 42945 guard | 8745 requests, 0 errors, all 500 |
 | uninstall after load | 302 |
 | invalid ABI (`float`) | explicit error, no install |
 | target exits during patch | `target_gone`, no crash |
