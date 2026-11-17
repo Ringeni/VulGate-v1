@@ -1,14 +1,20 @@
-/* Standalone libffi bridge: funchook + libffi + Shadow VM.
+/* Independent INT3/SIGTRAP hook bridge for the VulGate Shadow VM.
  *
- * This is the experimental production path. Frida is used only as the
- * injector/loader; all per-hit work happens in this C library.
+ * No funchook, libffi, or Frida hook engine is used. Frida (if any) is only the
+ * loader. The first byte of each target is replaced with INT3; the SIGTRAP
+ * handler runs the VM from the saved ucontext. PASS/observer single-steps the
+ * original instruction and re-inserts INT3; BLOCK returns the action directly.
  */
-#include <ffi.h>
-#include <funchook.h>
+#define _GNU_SOURCE
+#include <errno.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <ucontext.h>
+#include <unistd.h>
 
 #include "runtime/autoshield.h"
 
@@ -29,17 +35,15 @@ typedef enum {
     VG_NATURE_OBSERVER = 1,
 } vg_ffi_nature;
 
+typedef struct vg_ffi_patch vg_ffi_patch;
+
 typedef struct {
     void *target;
-    void *original;
     shadow_program program;
     shadow_policy policy;
-    ffi_cif cif;
-    ffi_type *ffi_args[SHADOW_MAX_ARGS];
-    ffi_closure *closure;
-    void *closure_code;
-    funchook_t *funchook;
+    unsigned char original_byte;
     unsigned nargs;
+    vg_ffi_type arg_types[SHADOW_MAX_ARGS];
     vg_ffi_type return_type;
     uint64_t action;
     vg_ffi_nature nature;
@@ -47,81 +51,101 @@ typedef struct {
     unsigned char local_slots[8];
     long long local_offsets[8];
     unsigned char local_sizes[8];
-    struct vg_ffi_patch *patch;
+    vg_ffi_patch *patch;
+    int installed;
 } vg_ffi_hook;
 
-typedef struct vg_ffi_patch {
+struct vg_ffi_patch {
     shadow_map maps[SHADOW_MAX_MAPS];
     shadow_map_entry *entries[SHADOW_MAX_MAPS];
     unsigned map_count;
     vg_ffi_hook hooks[VG_FFI_MAX_HOOKS];
     unsigned hook_count;
     int alive;
-} vg_ffi_patch;
+};
 
 static char vg_empty_string[1] = {0};
 static vg_ffi_patch g_patches[VG_FFI_MAX_PATCHES];
-static unsigned g_patch_count;
+static struct sigaction g_old_trap;
+static int g_trap_installed;
+static __thread vg_ffi_hook *tls_pending;
 
-static ffi_type *ffi_type_for(vg_ffi_type type)
+static vg_ffi_hook *find_hit(uintptr_t ip)
 {
+    for (unsigned p = 0; p < VG_FFI_MAX_PATCHES; p++) {
+        if (!g_patches[p].alive) continue;
+        for (unsigned h = 0; h < g_patches[p].hook_count; h++) {
+            vg_ffi_hook *hook = &g_patches[p].hooks[h];
+            if (hook->installed && ip - 1 == (uintptr_t)hook->target) return hook;
+        }
+    }
+    return NULL;
+}
+
+static void patch_page(void *addr, int prot)
+{
+    long page = sysconf(_SC_PAGESIZE);
+    uintptr_t start = (uintptr_t)addr & ~((uintptr_t)page - 1);
+    mprotect((void *)start, (size_t)page, prot);
+}
+
+static void write_int3(vg_ffi_hook *hook)
+{
+    patch_page(hook->target, PROT_READ | PROT_WRITE | PROT_EXEC);
+    *(unsigned char *)hook->target = 0xCC;
+    patch_page(hook->target, PROT_READ | PROT_EXEC);
+}
+
+static void restore_byte(vg_ffi_hook *hook)
+{
+    patch_page(hook->target, PROT_READ | PROT_WRITE | PROT_EXEC);
+    *(unsigned char *)hook->target = hook->original_byte;
+    patch_page(hook->target, PROT_READ | PROT_EXEC);
+}
+
+static uint64_t x86_arg(const ucontext_t *uc, unsigned index, vg_ffi_type type)
+{
+    static const int regs[6] = {REG_RDI, REG_RSI, REG_RDX, REG_RCX, REG_R8, REG_R9};
+    uint64_t raw;
+    if (index < 6) {
+        raw = (uint64_t)uc->uc_mcontext.gregs[regs[index]];
+    } else {
+        uintptr_t sp = (uintptr_t)uc->uc_mcontext.gregs[REG_RSP];
+        raw = *(uint64_t *)(sp + 8 + (index - 6) * 8);
+    }
     switch (type) {
-    case VG_TYPE_POINTER: return &ffi_type_pointer;
-    case VG_TYPE_INT: return &ffi_type_sint32;
-    case VG_TYPE_UINT: return &ffi_type_uint32;
-    case VG_TYPE_INT64: return &ffi_type_sint64;
-    case VG_TYPE_UINT64: return &ffi_type_uint64;
-    case VG_TYPE_VOID: return &ffi_type_void;
-    default: return NULL;
+    case VG_TYPE_INT: return (uint64_t)(int64_t)(int32_t)raw;
+    case VG_TYPE_UINT: return (uint64_t)(uint32_t)raw;
+    default: return raw;
     }
 }
 
-static uint64_t read_arg(void *ptr, vg_ffi_type type)
+static void set_return(ucontext_t *uc, vg_ffi_hook *hook)
 {
-    switch (type) {
-    case VG_TYPE_INT: return (uint64_t)(int64_t)*(int32_t *)ptr;
-    case VG_TYPE_UINT: return (uint64_t)*(uint32_t *)ptr;
-    case VG_TYPE_INT64: return (uint64_t)*(int64_t *)ptr;
-    case VG_TYPE_UINT64: return *(uint64_t *)ptr;
-    case VG_TYPE_POINTER: return (uint64_t)(uintptr_t)*(void **)ptr;
-    default: return 0;
+    uint64_t value = hook->action;
+    switch (hook->return_type) {
+    case VG_TYPE_INT: uc->uc_mcontext.gregs[REG_RAX] = (greg_t)(int32_t)value; break;
+    case VG_TYPE_UINT: uc->uc_mcontext.gregs[REG_RAX] = (greg_t)(uint32_t)value; break;
+    case VG_TYPE_VOID: break;
+    default: uc->uc_mcontext.gregs[REG_RAX] = (greg_t)value; break;
     }
+    uintptr_t sp = (uintptr_t)uc->uc_mcontext.gregs[REG_RSP];
+    uc->uc_mcontext.gregs[REG_RIP] = (greg_t)*(uintptr_t *)sp;
+    uc->uc_mcontext.gregs[REG_RSP] = (greg_t)(sp + 8);
+    uc->uc_mcontext.gregs[REG_EFL] &= ~(greg_t)0x100;
 }
 
-static void write_ret(void *ret, vg_ffi_type type, uint64_t value)
+static void run_vm(vg_ffi_hook *hook, const ucontext_t *uc, shadow_decision *decision)
 {
-    switch (type) {
-    case VG_TYPE_INT: *(int32_t *)ret = (int32_t)value; break;
-    case VG_TYPE_UINT: *(uint32_t *)ret = (uint32_t)value; break;
-    case VG_TYPE_INT64: *(int64_t *)ret = (int64_t)value; break;
-    case VG_TYPE_UINT64: *(uint64_t *)ret = value; break;
-    case VG_TYPE_POINTER: *(void **)ret = (void *)(uintptr_t)value; break;
-    default: break;
-    }
-}
-
-static void closure_handler(ffi_cif *cif, void *ret, void **args, void *user_data)
-{
-    vg_ffi_hook *hook = (vg_ffi_hook *)user_data;
-    vg_ffi_type arg_types[SHADOW_MAX_ARGS];
     shadow_ctx ctx;
     shadow_stats stats;
-
-    /* Argument type descriptors follow the hook in the sig table. */
-    /* Stored in hook->ffi_args is ffi_type*, but we also need our own codes.
-     * Keep the codes in a side table keyed by hook address. */
-    extern unsigned char vg_ffi_arg_codes[VG_FFI_MAX_PATCHES][VG_FFI_MAX_HOOKS][SHADOW_MAX_ARGS];
-    extern unsigned char vg_ffi_ret_codes[VG_FFI_MAX_PATCHES][VG_FFI_MAX_HOOKS];
-    unsigned patch_index = (unsigned)(hook->patch - g_patches);
-    unsigned hook_index = (unsigned)(hook - hook->patch->hooks);
-    for (unsigned i = 0; i < hook->nargs && i < SHADOW_MAX_ARGS; i++) {
-        arg_types[i] = (vg_ffi_type)vg_ffi_arg_codes[patch_index][hook_index][i];
-    }
-
     shadow_ctx_init(&ctx);
     memset(&stats, 0, sizeof(stats));
+    for (unsigned i = 0; i < hook->nargs && i < SHADOW_MAX_ARGS; i++) {
+        ctx.args[i] = x86_arg(uc, i, hook->arg_types[i]);
+    }
     if (hook->nlocals) {
-        uintptr_t frame = (uintptr_t)__builtin_frame_address(1);
+        uintptr_t frame = (uintptr_t)uc->uc_mcontext.gregs[REG_RBP];
         for (unsigned i = 0; i < hook->nlocals && i < 8; i++) {
             uintptr_t address = frame + (uintptr_t)hook->local_offsets[i];
             uint64_t value = 0;
@@ -134,61 +158,62 @@ static void closure_handler(ffi_cif *cif, void *ret, void **args, void *user_dat
             ctx.regs[hook->local_slots[i]] = value;
         }
     }
-    for (unsigned i = 0; i < hook->nargs && i < SHADOW_MAX_ARGS; i++) {
-        ctx.args[i] = read_arg(args[i], arg_types[i]);
-    }
     ctx.maps = hook->patch->maps;
     ctx.map_count = hook->patch->map_count;
-
-    shadow_decision decision = run_ebpf_vm(&ctx, &hook->program, &hook->policy, &stats);
-    vg_ffi_type ret_type = (vg_ffi_type)vg_ffi_ret_codes[patch_index][hook_index];
-    if (getenv("VG_FFI_DEBUG")) {
-        FILE *df = fopen("/tmp/vgffi-debug.log", "a");
-        if (df) {
-            fprintf(df, "VGFFI nargs=%u dec=%d", hook->nargs, (int)decision);
-            for (unsigned i = 0; i < hook->nargs; i++) {
-                fprintf(df, " a%u=%llx", i, (unsigned long long)ctx.args[i]);
-            }
-            if (hook->nargs > 0 && ctx.args[0]) {
-                uintptr_t p0 = (uintptr_t)ctx.args[0];
-                fprintf(df, " f40=%llx f1183=%x", (unsigned long long)*(uint64_t *)(p0 + 40),
-                        *(uint32_t *)(p0 + 1183));
-            }
-            fprintf(df, "\n");
-            fclose(df);
-        }
-    }
-
-    if (hook->nature == VG_NATURE_OBSERVER) {
-        ffi_call(cif, FFI_FN(hook->original), ret, args);
-        return;
-    }
-    if (decision == SHADOW_BLOCK || decision == SHADOW_UNKNOWN || decision == SHADOW_VM_ERROR) {
-        write_ret(ret, ret_type, hook->action);
-        return;
-    }
-    ffi_call(cif, FFI_FN(hook->original), ret, args);
+    *decision = run_ebpf_vm(&ctx, &hook->program, &hook->policy, &stats);
 }
 
-unsigned char vg_ffi_arg_codes[VG_FFI_MAX_PATCHES][VG_FFI_MAX_HOOKS][SHADOW_MAX_ARGS];
-unsigned char vg_ffi_ret_codes[VG_FFI_MAX_PATCHES][VG_FFI_MAX_HOOKS];
+static void trap_handler(int sig, siginfo_t *info, void *ucontext_raw)
+{
+    (void)sig;
+    (void)info;
+    ucontext_t *uc = (ucontext_t *)ucontext_raw;
+    if (tls_pending) {
+        vg_ffi_hook *pending = tls_pending;
+        tls_pending = NULL;
+        write_int3(pending);
+        return;
+    }
+    vg_ffi_hook *hook = find_hit((uintptr_t)uc->uc_mcontext.gregs[REG_RIP]);
+    if (!hook) {
+        if (g_old_trap.sa_sigaction) g_old_trap.sa_sigaction(sig, info, ucontext_raw);
+        return;
+    }
+    shadow_decision decision;
+    run_vm(hook, uc, &decision);
+    if (hook->nature == VG_NATURE_GUARD &&
+        (decision == SHADOW_BLOCK || decision == SHADOW_UNKNOWN ||
+         decision == SHADOW_VM_ERROR)) {
+        set_return(uc, hook);
+        return;
+    }
+    restore_byte(hook);
+    uc->uc_mcontext.gregs[REG_EFL] |= 0x100;
+    tls_pending = hook;
+}
+
+static int install_sigaction(void)
+{
+    if (g_trap_installed) return 0;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = trap_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+    if (sigaction(SIGTRAP, &sa, &g_old_trap) != 0) return -1;
+    g_trap_installed = 1;
+    return 0;
+}
 
 __attribute__((visibility("default")))
 long vg_ffi_patch_create(unsigned map_count, const unsigned *capacities)
 {
-    if (map_count > SHADOW_MAX_MAPS) {
-        return -1;
-    }
+    if (map_count > SHADOW_MAX_MAPS) return -1;
     int slot = -1;
     for (unsigned i = 0; i < VG_FFI_MAX_PATCHES; i++) {
-        if (!g_patches[i].alive) {
-            slot = (int)i;
-            break;
-        }
+        if (!g_patches[i].alive) { slot = (int)i; break; }
     }
-    if (slot < 0) {
-        return -1;
-    }
+    if (slot < 0) return -1;
     vg_ffi_patch *patch = &g_patches[slot];
     memset(patch, 0, sizeof(*patch));
     patch->map_count = map_count;
@@ -198,9 +223,7 @@ long vg_ffi_patch_create(unsigned map_count, const unsigned *capacities)
         if (!capacity) capacity = 1;
         patch->entries[i] = calloc(capacity, sizeof(shadow_map_entry));
         if (!patch->entries[i]) return -2;
-        if (shadow_map_init(&patch->maps[i], patch->entries[i], capacity) != 0) {
-            return -2;
-        }
+        if (shadow_map_init(&patch->maps[i], patch->entries[i], capacity) != 0) return -2;
     }
     return (long)slot;
 }
@@ -214,24 +237,17 @@ long vg_ffi_patch_install(long patch_handle, void *target,
                           const long long *local_offsets, const unsigned char *local_sizes)
 {
     if (patch_handle < 0 || (unsigned long)patch_handle >= VG_FFI_MAX_PATCHES ||
-        !target || !code || !code_len || nargs > SHADOW_MAX_ARGS) {
-        return -1;
-    }
+        !target || !code || !code_len || nargs > SHADOW_MAX_ARGS) return -1;
     vg_ffi_patch *patch = &g_patches[patch_handle];
-    if (!patch->alive || patch->hook_count >= VG_FFI_MAX_HOOKS) {
-        return -1;
-    }
-    unsigned patch_index = (unsigned)patch_handle;
-    unsigned hook_index = patch->hook_count;
-    vg_ffi_hook *hook = &patch->hooks[hook_index];
+    if (!patch->alive || patch->hook_count >= VG_FFI_MAX_HOOKS) return -1;
+    if (install_sigaction() != 0) return -3;
+    vg_ffi_hook *hook = &patch->hooks[patch->hook_count];
     memset(hook, 0, sizeof(*hook));
     hook->patch = patch;
     hook->target = target;
     hook->nargs = nargs;
     hook->return_type = (vg_ffi_type)return_type;
-    hook->action = action_kind == 1
-        ? (uint64_t)(uintptr_t)vg_empty_string
-        : (uint64_t)action;
+    hook->action = action_kind == 1 ? (uint64_t)(uintptr_t)vg_empty_string : (uint64_t)action;
     hook->nature = (vg_ffi_nature)nature;
     hook->nlocals = nlocals > 8 ? 8 : nlocals;
     for (unsigned i = 0; i < hook->nlocals; i++) {
@@ -239,44 +255,18 @@ long vg_ffi_patch_install(long patch_handle, void *target,
         hook->local_offsets[i] = local_offsets[i];
         hook->local_sizes[i] = local_sizes[i];
     }
-
-    if (shadow_program_init(code, code_len, &hook->program) != 0 ||
-        shadow_program_validate(&hook->program) != 0) {
-        return -2;
+    for (unsigned i = 0; i < nargs; i++) {
+        hook->arg_types[i] = (vg_ffi_type)arg_types[i];
     }
+    if (shadow_program_init(code, code_len, &hook->program) != 0 ||
+        shadow_program_validate(&hook->program) != 0) return -2;
     shadow_policy_init(&hook->policy);
     hook->policy.step_limit = 4096;
-    for (unsigned i = 0; i < nargs; i++) {
-        vg_ffi_type type = (vg_ffi_type)arg_types[i];
-        hook->ffi_args[i] = ffi_type_for(type);
-        if (!hook->ffi_args[i]) return -3;
-        vg_ffi_arg_codes[patch_index][hook_index][i] = (unsigned char)type;
-    }
-    vg_ffi_ret_codes[patch_index][hook_index] = (unsigned char)return_type;
-    ffi_type *ret_type = ffi_type_for((vg_ffi_type)return_type);
-    if (!ret_type) return -3;
-    if (ffi_prep_cif(&hook->cif, FFI_DEFAULT_ABI, nargs, ret_type,
-                     hook->ffi_args) != FFI_OK) {
-        return -4;
-    }
-    hook->closure = ffi_closure_alloc(sizeof(ffi_closure), &hook->closure_code);
-    if (!hook->closure) return -5;
-    if (ffi_prep_closure_loc(hook->closure, &hook->cif, closure_handler,
-                             hook, hook->closure_code) != FFI_OK) {
-        return -6;
-    }
-    if (getenv("VG_FFI_HOOK_DEBUG")) funchook_set_debug_file("/tmp/funchook-debug.log");
-    hook->funchook = funchook_create();
-    if (!hook->funchook) return -7;
-    hook->original = target;
-    if (funchook_prepare(hook->funchook, &hook->original, hook->closure_code) != 0) {
-        return -8;
-    }
-    if (funchook_install(hook->funchook, 0) != 0) {
-        return -9;
-    }
+    hook->original_byte = *(unsigned char *)target;
+    write_int3(hook);
+    hook->installed = 1;
     patch->hook_count++;
-    return (long)hook_index;
+    return (long)(patch->hook_count - 1);
 }
 
 __attribute__((visibility("default")))
@@ -287,17 +277,12 @@ int vg_ffi_patch_destroy(long patch_handle)
     if (!patch->alive) return -1;
     for (unsigned i = 0; i < patch->hook_count; i++) {
         vg_ffi_hook *hook = &patch->hooks[i];
-        if (hook->funchook) {
-            funchook_uninstall(hook->funchook, 0);
-            funchook_destroy(hook->funchook);
-        }
-        if (hook->closure) {
-            ffi_closure_free(hook->closure);
+        if (hook->installed) {
+            restore_byte(hook);
+            hook->installed = 0;
         }
     }
-    for (unsigned i = 0; i < patch->map_count; i++) {
-        free(patch->entries[i]);
-    }
+    for (unsigned i = 0; i < patch->map_count; i++) free(patch->entries[i]);
     memset(patch, 0, sizeof(*patch));
     return 0;
 }
@@ -311,6 +296,3 @@ unsigned vg_ffi_hook_count(void)
     }
     return total;
 }
-
-
-

@@ -7,7 +7,7 @@ that target.
 
 | # | CVE | App | FFI mount | Trigger | Result |
 |---:|---|---|---|---|---|
-| 1 | CVE-2026-15176 | nginx | `coarse: ngx_http_static_handler` | `/files/file.txt` | 200 → 500 |
+| 1 | CVE-2026-15176 | nginx | `ngx_http_map_uri_to_path` (INT3) | `/files/file.txt` | 200 → 500 |
 | 2 | CVE-2026-27654 | nginx | `ngx_http_dav_copy_move_handler` | DAV COPY | 204 → 405 |
 | 3 | CVE-2026-42055 | nginx | `proxy_v2_create_request` + `grpc_create_request` | `/h2proxy`, `/grpc` | 502 → 500 |
 | 4 | CVE-2026-42533 | nginx | `ngx_http_map_variable` | `/map/ordinary` | BLOCK run=1, HTTP 200 |
@@ -23,10 +23,10 @@ that target.
 | 14 | CVE-2026-9256 | nginx | `ngx_http_rewrite_handler` | `/rewrite/ordinary` | 302 → 500 |
 | 15 | CVE-2026-93479 | nginx | `coarse: ngx_http_rewrite_handler` | `/rewrite/ordinary` | 500; original fine version hangs |
 | 16 | CVE-2026-93546 | httpd | `dav_method_proppatch` | PROPPATCH | 207 → 503 |
-| 17 | CVE-2026-97205 | nginx | `coarse: ngx_http_output_filter` | SSI + proxy_store + aio_write | 000; guard run=1 |
+| 17 | CVE-2026-97205 | nginx | `ngx_http_copy_filter` (INT3) | SSI + proxy_store + aio_write | 000; guard run=1 |
 | 18 | CVE-2026-109618 | PHP | `rfc1867_post_handler` | multipart upload | files empty |
 | 19 | CVE-2026-109619 | PHP | `php_session_rfc1867_callback` | fresh PHPSESSID progress upload | files normal, progress=false |
-| 20 | CVE-2026-111497 | brotli | callsite `WriteRingBuffer` | real worker | error=-9, produced=0 |
+| 20 | CVE-2026-111497 | brotli | single-entry `WriteRingBuffer` | real worker | error=-9, produced=0 |
 
 ## Extreme-condition checks
 
@@ -43,9 +43,9 @@ that target.
 
 ## Notes
 
-- `ffi_run.py` automatically maps 15176 / 97205 / 93479 to the coarse
-  return-only patches listed above, so these use pure funchook, not Frida
-  fallback.
+- `ffi_run.py` maps 93479 to its coarse return-only patch and 111497 to a
+  single-entry observer+guard form. 15176 and 97205 now run the original fine
+  DSLs directly on the INT3 engine.
 - 42533 / 60005 / 97205 execute BLOCK but the target function does not map that
   return value to a standard HTTP 500/503.
 - 47360's final HTTP 404 is produced by httpd's ErrorDocument internal

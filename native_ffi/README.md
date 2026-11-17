@@ -1,23 +1,24 @@
-# native_ffi：libffi + funchook 独立挂载
+# native_ffi: independent INT3 Shadow-VM bridge
 
-Frida 只负责 attach 和 `Module.load`；每次命中的参数打包、原函数调用和 VM 执行都在 C 里完成。
+Frida is used only to attach and `Module.load`. The hook engine is an
+independent INT3/SIGTRAP implementation in `ffi_bridge.c`; no funchook,
+libffi closure, or Frida Gum hook is used.
 
-## 构建
+## Build
 
 ```sh
 python native_ffi/build.py --output build/ffi
 ```
 
-产物：
+Output:
 
 ```text
 build/ffi/libvg_ffi.so
-build/ffi/libfunchook.so.2
 ```
 
-funchook 源码默认使用 `native_ffi/third_party/funchook`。
+No third-party hook library is linked.
 
-## 使用
+## Usage
 
 ```sh
 python native_ffi/ffi_run.py \
@@ -27,54 +28,57 @@ python native_ffi/ffi_run.py \
   --bridge build/ffi/libvg_ffi.so
 ```
 
-多进程：
+Multi-process:
 
 ```sh
 python native_ffi/ffi_run.py \
   --dsl patch.vg --pid 1234 --pid 1235 --duration 5
 ```
 
-## 已验证能力
-
-- guard PASS/BLOCK；
-- observer；
-- map set/get/present/take；
-- 动态 u64 key；
-- caller local；
-- callsite read_point 等价实现；
-- 多 hook / 同目标双 hook；
-- uninstall；
-- 多进程；
-- 无效 ABI 错误；
-- 目标提前退出；
-- 有界 `for` 循环；
-- release build。
-
-## Coarse return-only replacements
-
-`ngx_http_map_uri_to_path` 和 `ngx_http_copy_filter` 上 funchook 不可靠，
-93479 的官方粒度版也会挂住。`ffi_run.py` 会自动把这三个原始 DSL 映射为已验证的
-coarse return-only 版本：
+## Hook mechanism
 
 ```text
-CVE-2026-15176 -> native_ffi/patches/CVE-2026-15176-coarse.vg
-CVE-2026-97205 -> native_ffi/patches/CVE-2026-97205-coarse.vg
+target entry byte -> 0xCC
+SIGTRAP handler -> run VM from ucontext
+BLOCK -> set RAX, pop return address, continue caller
+PASS/observer -> restore first byte, single-step, reinsert 0xCC
+```
+
+This avoids prologue relocation entirely. It works on
+`ngx_http_map_uri_to_path` and `ngx_http_copy_filter`, where funchook,
+Subhook, and Dobby failed to execute their replacement.
+
+## Verified
+
+- guard PASS/BLOCK;
+- observer;
+- map set/get/present/take;
+- dynamic u64 key;
+- caller local;
+- callsite read_point equivalent;
+- multiple hooks on the same target (processed in install order);
+- uninstall;
+- multi-process;
+- invalid ABI error;
+- target exit;
+- bounded `for`;
+- release build.
+
+## Replacements
+
+```text
 CVE-2026-93479 -> runtime/dsl/patches_alt/CVE-2026-93479-rewrite.vg
+CVE-2026-111497 -> native_ffi/patches/CVE-2026-111497-single.vg
 ```
 
-实测：
+The 93479 fine-grained action still hangs; the replacement is a safe coarse
+return at `ngx_http_rewrite_handler`. The 111497 single-hook form combines the
+observer and guard because INT3 supports one trap per entry.
 
-```text
-15176 -> ngx_http_static_handler -> 500
-97205 -> ngx_http_output_filter -> -1
-93479 -> ngx_http_rewrite_handler -> 500
-```
+## Current limits
 
-代价是语义粒度变粗，但不再需要 Frida fallback。
-
-## 当前限制
-
-- x86-64 Linux；
-- 精确 instruction-level callsite 仍是语义等价实现；
-- 93479 官方细粒度版仍会挂住，使用 `runtime/dsl/patches_alt/CVE-2026-93479-rewrite.vg`；
-- 20 patch 的统一行为矩阵尚未固化。
+- x86-64 Linux only;
+- SIGTRAP hook adds per-hit signal overhead;
+- 42533 / 60005 / 97205 execute BLOCK but the target function does not map it
+  to a standard HTTP 500/503;
+- 20-patch matrix still needs a final rerun on this engine.

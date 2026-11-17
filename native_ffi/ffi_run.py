@@ -95,17 +95,11 @@ def _translate_callsite(patch) -> None:
         mount.return_type = reference.return_type
 
 
-FRIDA_FALLBACK_SYMBOLS = {
-    # funchook cannot relocate this function's prologue reliably; Frida's
-    # Interceptor is used only for this mount.
-    'ngx_http_map_uri_to_path',
-    'ngx_http_copy_filter',
-}
+FRIDA_FALLBACK_SYMBOLS = set()
 
 COARSE_REPLACEMENTS = {
-    'CVE-2026-15176': ROOT / 'native_ffi' / 'patches' / 'CVE-2026-15176-coarse.vg',
-    'CVE-2026-97205': ROOT / 'native_ffi' / 'patches' / 'CVE-2026-97205-coarse.vg',
     'CVE-2026-93479': ROOT / 'runtime' / 'dsl' / 'patches_alt' / 'CVE-2026-93479-rewrite.vg',
+    'CVE-2026-111497': ROOT / 'native_ffi' / 'patches' / 'CVE-2026-111497-single.vg',
 }
 
 
