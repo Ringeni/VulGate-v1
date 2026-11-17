@@ -617,7 +617,10 @@ def compile_patch(patch: dsl_parser.PatchSpec,
         code = compiler.compile(condition)
         mounts.append(VMMount(mount.id, mount.module, mount.symbol, mount.offset,
                               list(mount.args), mount.return_type, code, action_id,
-                              nature))
+                              nature,
+                              [{'name': name, 'slot': slot,
+                                'recipe': mount.local_recipes[name]}
+                               for name, slot in local_slots.items()]))
         if action_id not in patch.actions:
             raise ExprError('unknown action: ' + action_id)
     return VMPatch(mounts, dict(global_addresses), state.export())
