@@ -42,6 +42,10 @@ HELPER_READ_U64 = 6
 HELPER_MAP_SET = 9
 HELPER_MAP_GET = 10
 HELPER_MAP_PRESENT = 11
+HELPER_SET_REG = 13
+OP_SUB_K64 = 0x17
+OP_JGT_K = 0x25
+MAX_LOOP_ITERATIONS = 256
 
 READ_HELPERS = {
     'vg_read_u8': HELPER_READ_U8,
@@ -194,7 +198,7 @@ class Parser:
                 return ('local', name.strip('"'))
             if re.fullmatch(r'arg\d+', value):
                 return ('arg', int(value[3:]))
-            raise ExprError('unknown name: ' + value)
+            return ('var', value)
         if value == '(':
             expression = self.expression(0)
             self.take(')')
@@ -264,6 +268,7 @@ class Compiler:
         self.overrides = overrides or {}
         self.map_state = map_state
         self.local_slots = local_slots or {}
+        self.vars: dict[str, int] = {}
         self.asm = Assembler()
 
     def value(self, node, dst: int = 6) -> None:
@@ -308,6 +313,12 @@ class Compiler:
             if node[1] not in self.local_slots:
                 raise ExprError('local not resolved: ' + node[1])
             self.asm.emit(OP_MOV_K64, 1, imm=self.local_slots[node[1]])
+            self.asm.emit(OP_CALL, imm=HELPER_GET_REG)
+            self.asm.emit(OP_MOV_X64, dst, 0)
+        elif kind == 'var':
+            if node[1] not in self.vars:
+                raise ExprError('unknown loop variable: ' + node[1])
+            self.asm.emit(OP_MOV_K64, 1, imm=self.vars[node[1]])
             self.asm.emit(OP_CALL, imm=HELPER_GET_REG)
             self.asm.emit(OP_MOV_X64, dst, 0)
         elif kind == 'read':
@@ -409,6 +420,61 @@ class Compiler:
         self.asm.emit(OP_MOV_X64, 2, 9)
         self.asm.emit(OP_CALL, imm=HELPER_MAP_SET)
 
+    def compile_loop(self, variable: str, start: int, bound: int, body: str) -> None:
+        """Emit a verifier-bounded countdown loop.
+
+        The emitted shape intentionally mirrors the loop pattern accepted by
+        runtime/vm.c's validate_bounded_backedge():
+
+            <set loop variable>
+            MOV  r15, count
+        L:  <body, does not modify r15>
+            <increment loop variable>
+            SUB  r15, 1
+            JGT  r15, 0, L
+
+        count must be a positive compile-time constant.
+        """
+        count = bound - start
+        if start < 0 or count < 1 or count > MAX_LOOP_ITERATIONS:
+            raise ExprError('loop bound must be a constant in 1..%d' %
+                            MAX_LOOP_ITERATIONS)
+        if variable in self.vars:
+            raise ExprError('nested loops are not supported: ' + variable)
+        if any(slot in (10, 14) for slot in self.local_slots.values()):
+            raise ExprError('local slot collides with loop temporary registers')
+        variable_slot = 14
+        counter_slot = 10
+        self.asm.emit(OP_MOV_K64, 1, imm=variable_slot)
+        self.asm.emit(OP_MOV_K64, 2, imm=start)
+        self.asm.emit(OP_CALL, imm=HELPER_SET_REG)
+        self.asm.const(counter_slot, count)
+        target = self.asm.label('loop')
+        self.asm.mark(target)
+        previous = self.vars.get(variable)
+        self.vars[variable] = variable_slot
+        try:
+            for match in re.finditer(
+                    r'map\["([^"]+)"\]\[(.+?)\]\s*=\s*(.+?);',
+                    body, re.S):
+                map_name, key_expression, value_expression = match.groups()
+                self.map_set(map_name, Parser(key_expression).parse(),
+                             Parser(value_expression).parse())
+        finally:
+            if previous is None:
+                self.vars.pop(variable, None)
+            else:
+                self.vars[variable] = previous
+        self.asm.emit(OP_MOV_K64, 1, imm=variable_slot)
+        self.asm.emit(OP_CALL, imm=HELPER_GET_REG)
+        self.asm.emit(OP_MOV_X64, 2, 0)
+        self.asm.emit(OP_MOV_K64, 8, imm=1)
+        self.asm.emit(OP_ADD_X64, 2, 8)
+        self.asm.emit(OP_MOV_K64, 1, imm=variable_slot)
+        self.asm.emit(OP_CALL, imm=HELPER_SET_REG)
+        self.asm.emit(OP_SUB_K64, counter_slot, imm=1)
+        self.asm.emit(OP_JGT_K, counter_slot, imm=0, target=target)
+
     def compile(self, condition) -> bytes:
         block = self.asm.label('block')
         passed = self.asm.label('pass')
@@ -468,6 +534,20 @@ class MapState:
                 for name in self.order]
 
 
+LOOP_PATTERN = re.compile(
+    r'for\s*\(\s*(\w+)\s*=\s*(\d+)\s*;\s*\1\s*<\s*(\d+)\s*;'
+    r'\s*\1\s*\+\+\s*\)\s*\{(.*?)\}', re.S)
+
+
+def _find_loops(body: str):
+    return [(match.group(1), int(match.group(2)), int(match.group(3)),
+             match.group(4)) for match in LOOP_PATTERN.finditer(body)]
+
+
+def _strip_loops(body: str) -> str:
+    return LOOP_PATTERN.sub('', body)
+
+
 def _extract(body: str) -> tuple[dict[str, str], str, str]:
     selectors: dict[str, str] = {}
     for line in body.splitlines():
@@ -504,9 +584,15 @@ def compile_patch(patch: dsl_parser.PatchSpec,
         read_point = mount.nature in ('\u8bfb\u53d6\u70b9', 'read_point')
         nature = 'read_point' if read_point else 'intercept'
         if read_point:
-            assignments = _extract_observer(mount.body)
+            loops = _find_loops(mount.body)
+            remaining = _strip_loops(mount.body)
+            assignments = (_extract_observer(remaining) if 'map[' in remaining else [])
+            if not loops and not assignments:
+                raise ExprError('read_point behavior needs map assignment or for loop')
             local_slots = {name: index for index, name in enumerate(mount.local_recipes)}
             compiler = Compiler({}, global_addresses, overrides, state, local_slots)
+            for variable, start, bound, body in loops:
+                compiler.compile_loop(variable, start, bound, body)
             for map_name, key_expression, expression in assignments:
                 compiler.map_set(map_name, Parser(key_expression).parse(),
                                  Parser(expression).parse())
@@ -519,12 +605,16 @@ def compile_patch(patch: dsl_parser.PatchSpec,
                                     'recipe': mount.local_recipes[name]}
                                    for name, slot in local_slots.items()]))
             continue
-        raw_selectors, condition_text, action_id = _extract(mount.body)
+        loops = _find_loops(mount.body)
+        raw_selectors, condition_text, action_id = _extract(_strip_loops(mount.body))
         selectors = {name: Parser(text).parse() for name, text in raw_selectors.items()}
         condition = Parser(condition_text).parse()
         local_slots = {name: index for index, name in enumerate(mount.local_recipes)}
-        code = Compiler(selectors, global_addresses, overrides, state,
-                        local_slots).compile(condition)
+        compiler = Compiler(selectors, global_addresses, overrides, state,
+                            local_slots)
+        for variable, start, bound, body in loops:
+            compiler.compile_loop(variable, start, bound, body)
+        code = compiler.compile(condition)
         mounts.append(VMMount(mount.id, mount.module, mount.symbol, mount.offset,
                               list(mount.args), mount.return_type, code, action_id,
                               nature))

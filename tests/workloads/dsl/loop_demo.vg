@@ -1,0 +1,35 @@
+map limits:
+{
+    capacity: 16
+}
+
+action REJECT:
+{
+    return_type: int
+    return: -73
+}
+
+mount observe_loop:
+{
+    location: symbol="observe_limit", args=[uint64, uint64], return=void
+    nature: read_point
+    behavior:
+    {
+        for (i = 0; i < 4; i++) {
+            map["limits"][i] = 1;
+        }
+    }
+}
+
+mount check_loop:
+{
+    location: symbol="target_fn", args=[uint64, uint64], return=int
+    nature: intercept
+    behavior:
+    {
+        value["present"] = map_present("limits", 3);
+        if (value["present"] != 0) {
+            return block("REJECT");
+        }
+    }
+}

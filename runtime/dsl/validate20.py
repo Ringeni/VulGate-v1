@@ -26,7 +26,7 @@ TEST_VALUES = {
     'CVE-2026-109618': {'activated': 0, 'throws': 0, 'uploads': 0},
     'CVE-2026-111497': {'remaining': 0, 'sample_present': 0, 'occupied': 0,
                         'capacity': 8, 'next_in': 0, 'last_in': 0, 'available_in': 0},
-    'CVE-2026-15176': {'alias': 1, 'flags': 32},
+    'CVE-2026-15176': {'alias': 1, 'flags': 8},
     'CVE-2026-47360': {'previous': 1},
     'CVE-2026-60005': {'captures': 1, 'flags': 8},
     'CVE-2026-97205': {'counter': 250},

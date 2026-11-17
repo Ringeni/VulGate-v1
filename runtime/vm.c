@@ -245,7 +245,8 @@ static int helper_allowed(shadow_s32 helper_id)
            helper_id == SHADOW_HELPER_MAP_SET ||
            helper_id == SHADOW_HELPER_MAP_GET ||
            helper_id == SHADOW_HELPER_MAP_PRESENT ||
-           helper_id == SHADOW_HELPER_MAP_DELETE;
+           helper_id == SHADOW_HELPER_MAP_DELETE ||
+           helper_id == SHADOW_HELPER_SET_REG;
 }
 
 static int validate_bounded_backedge(const shadow_program *program, size_t pc, size_t target)
@@ -574,6 +575,14 @@ static int run_helper(shadow_u64 helper_id,
             return -1;
         }
         regs[0] = ctx->regs[regs[1]];
+        return 0;
+    case SHADOW_HELPER_SET_REG:
+        if (regs[1] >= SHADOW_MAX_REGS) {
+            regs[0] = (shadow_u64)-1;
+            return -1;
+        }
+        ((shadow_ctx *)ctx)->regs[regs[1]] = regs[2];
+        regs[0] = 0;
         return 0;
     case SHADOW_HELPER_SCRATCH_LOAD:
         if (regs[1] >= SHADOW_MAX_SCRATCH) {
