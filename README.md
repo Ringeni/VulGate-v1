@@ -526,7 +526,7 @@ patched:  result=0, error=-9, produced=0
 | 14 | CVE-2026-9256 | nginx | `ngx_http_rewrite_handler` | 已验证：500 |
 | 15 | CVE-2026-93479 | nginx | `ngx_http_script_check_length` | **未通过**：真实 nginx 下请求挂住 |
 | 16 | CVE-2026-93546 | httpd | `dav_method_proppatch` | 已验证：PROPPATCH 207 → 503 |
-| 17 | CVE-2026-97205 | nginx | `ngx_http_copy_filter` | 已命中；请求条件未触发 |
+| 17 | CVE-2026-97205 | nginx | `ngx_http_copy_filter` | 已验证触发：SSI + proxy_store + aio_write，run=1；HTTP 000（action -1 断流） |
 | 18 | CVE-2026-109618 | PHP | `rfc1867_post_handler` | 已验证：multipart 解析被阻断 |
 | 19 | CVE-2026-109619 | PHP | `php_session_rfc1867_callback` | 已验证：fresh session 下 files 正常、progress=false |
 | 20 | CVE-2026-111497 | brotli | callsite → `WriteRingBuffer` | 已验证：error=-9 |
@@ -540,8 +540,8 @@ patched:  result=0, error=-9, produced=0
 - `93479` 的 coarse 替代版本在 `runtime/dsl/patches_alt/CVE-2026-93479-rewrite.vg`：
   hook `ngx_http_rewrite_handler`，返回 500，不需要 action writes；已验证真实 nginx 500，但粒度比官方 check_length 条件粗；
 - 验证 109619 时必须使用新的 `PHPSESSID`（或开启 `session.upload_progress.cleanup`），否则会读到同一 session 上一次请求遗留的 progress，误判为未生效；
-- `97205` 的 guard 已挂载/命中，但当前请求没有触发其阻断条件，因此不能算“已验证阻断”；
 - `60005` 已用 SSI set subrequest 触发 run=1，但 action -1 没有在 HTTP 层体现；
+- `97205` 已用 SSI + proxy_store + aio_write 触发 run=1，HTTP 000 是 action -1 断流；
 - `42533` 的 guard 已执行 BLOCK，但该函数的返回 -1 没有改变 HTTP 200 结果，不能算 HTTP 层已验证阻断。
 
 ### 4.1 写依赖补丁的 return-only 降级
@@ -657,8 +657,8 @@ CLI 端到端安装（5 次）:
   - PHP：109618 通过，109619 在 fresh session 下通过；
   - brotli：111497 通过；
 - 93479 当前仍未通过；
-- 97205 的条件请求还没有构造完成；
 - 60005 已触发 run=1，但 HTTP 层没有体现 action 效果；
+- 97205 已触发 run=1，HTTP 000 是 action -1 断流；
 - 42533 的 BLOCK 已执行，但 HTTP 层没有观察到阻断效果。
 
 ---
