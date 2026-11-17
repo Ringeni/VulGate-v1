@@ -28,6 +28,19 @@ that target.
 | 19 | CVE-2026-109619 | PHP | `php_session_rfc1867_callback` | fresh PHPSESSID progress upload | files normal, progress=false |
 | 20 | CVE-2026-111497 | brotli | callsite `WriteRingBuffer` | real worker | error=-9, produced=0 |
 
+## Extreme-condition checks
+
+| Check | Result |
+|---|---|
+| 10 × install/uninstall, nginx 27654 | patched 405, after 204 |
+| 2-worker nginx, install on both pids | all COPY 405 |
+| 32-thread load, 42945 guard | 8745 requests, 0 errors, all 500 |
+| uninstall after load | 302 |
+| invalid ABI (`float`) | explicit error, no install |
+| target exits during patch | `target_gone`, no crash |
+| loop fixture | 4 iterations, body_calls=0 |
+| bounded loop bound > 256 | compile error |
+
 ## Notes
 
 - 15176 and 97205 coarse patches are pure funchook mounts and are listed in
