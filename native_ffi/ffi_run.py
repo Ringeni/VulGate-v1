@@ -99,6 +99,7 @@ FRIDA_FALLBACK_SYMBOLS = {
     # funchook cannot relocate this function's prologue reliably; Frida's
     # Interceptor is used only for this mount.
     'ngx_http_map_uri_to_path',
+    'ngx_http_copy_filter',
 }
 
 
