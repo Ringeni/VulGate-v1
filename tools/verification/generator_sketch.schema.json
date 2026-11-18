@@ -1,0 +1,70 @@
+{
+  "type": "object",
+  "properties": {
+    "schema": {"type": "integer", "enum": [1]},
+    "max_rounds": {"type": "integer", "minimum": 1, "maximum": 10000},
+    "solver_nodes": {"type": "integer", "minimum": 1, "maximum": 10000000},
+    "entries": {
+      "type": "array", "minItems": 1, "maxItems": 16,
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {"type": "string"},
+          "translation_unit": {"type": "string"},
+          "function": {"type": "string"},
+          "predicates": {"type": "array", "maxItems": 8, "items": {"$ref": "#/$defs/expression"}},
+          "returns": {
+            "type": "array", "minItems": 1, "maxItems": 16,
+            "items": {"anyOf": [
+              {"type": "integer", "minimum": -9223372036854775808, "maximum": 9223372036854775807},
+              {"type": "null"}
+            ]}
+          }
+        },
+        "required": ["id", "translation_unit", "function", "predicates", "returns"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["schema", "max_rounds", "solver_nodes", "entries"],
+  "additionalProperties": false,
+  "$defs": {
+    "expression": {
+      "anyOf": [
+        {
+          "type": "object", "properties": {"const": {"type": "integer", "minimum": -9223372036854775808, "maximum": 9223372036854775807}},
+          "required": ["const"], "additionalProperties": false
+        },
+        {
+          "type": "object", "properties": {"const": {"type": "boolean"}},
+          "required": ["const"], "additionalProperties": false
+        },
+        {
+          "type": "object", "properties": {"var": {"type": "string"}},
+          "required": ["var"], "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "base": {"$ref": "#/$defs/expression"},
+            "field": {"type": "string"}, "pointer": {"type": "boolean"}
+          },
+          "required": ["base", "field", "pointer"], "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {"base": {"$ref": "#/$defs/expression"}, "index": {"$ref": "#/$defs/expression"}},
+          "required": ["base", "index"], "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "op": {"type": "string", "enum": ["!", "~", "-", "*", "==", "!=", "<", "<=", ">", ">=", "&&", "||", "+", "/", "%", "&", "|", "^", "<<", ">>"]},
+            "args": {"type": "array", "minItems": 1, "maxItems": 2, "items": {"$ref": "#/$defs/expression"}}
+          },
+          "required": ["op", "args"], "additionalProperties": false
+        }
+      ]
+    }
+  }
+}

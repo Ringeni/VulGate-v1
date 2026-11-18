@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "command": ["python", "-m", "tools.verification.openai_generator", "--model", "YOUR_MODEL_ID"],
+  "directory": "../..",
+  "max_attempts": 4,
+  "timeout": 120,
+  "max_output_bytes": 1048576,
+  "max_rounds": 32,
+  "solver_nodes": 100000
+}
