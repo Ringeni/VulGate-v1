@@ -41,7 +41,10 @@ def run(profile, output):
         for mode in ['patched', 'baseline', 'reference']:
             if mode not in profile['workers']: continue
             workers[mode] = stack.enter_context(Worker(profile['workers'][mode], output / mode,
-                patch=profile['patch'] if mode == 'patched' else None, catalog=profile['catalog']))
+                patch=profile['patch'] if mode == 'patched' else None, catalog=profile['catalog'],
+                dsl=profile.get('dsl') if mode == 'patched' else None,
+                bridge_dir=profile.get('dsl_bridge'),
+                map_names=profile.get('empty_maps_after_episode')))
         analysis = analyze(profile, manifest, catalog, output / 'symbolic')
         monitor = VMReplay(profile['bridge'], {g['id']: {'path': g['rule_path'], 'step_limit': g.get('step_limit', 4096),
                                                         'observations': g.get('observations', [])}

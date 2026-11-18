@@ -13,10 +13,11 @@ def make(folder, cbmc):
     return {
         'schema': 1, 'name': 'brotli-streaming',
         'patch': str(folder / 'patch.json'), 'catalog': str(folder / 'actions.json'),
-        'guard': str(folder / 'guard.json'), 'bridge': str(ROOT / 'build/frida-linux/vulgate_frida.so'),
+        'guard': str(folder / 'guard.json'), 'bridge': str(ROOT / 'build/frida-vm/vulgate_frida.so'),
         'workers': {mode: [str(folder / ('reference' if mode == 'reference' else 'baseline') / 'worker')]
                     for mode in ['baseline', 'patched', 'reference']},
         'adapter': 'experiments.postdeploy.brotli.corpus',
+        'dsl': str(ROOT / 'runtime/dsl/patches/CVE-2026-111497.vg'),
         'encoder': str(folder / 'encoder'), 'seed': 20261112, 'fuzz_cases': 24,
         'adaptive_cases': 12,
         'build_records': [str(folder / name) for name in ['build.json', 'binding.json', 'layout.json']] +

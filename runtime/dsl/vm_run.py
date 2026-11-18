@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -103,10 +104,10 @@ function vg_fill(target, values, count) {
 }
 
 function vg_read_mem(address, size) {
-  if (size === 1) return Memory.readU8(address);
-  if (size === 2) return Memory.readU16(address);
-  if (size === 4) return Memory.readU32(address);
-  return Memory.readU64(address);
+  if (size === 1) return address.readU8();
+  if (size === 2) return address.readU16();
+  if (size === 4) return address.readU32();
+  return address.readU64();
 }
 
 function vg_local(recipe, context) {
@@ -123,7 +124,7 @@ function vg_local(recipe, context) {
   }
   let address = ptr(base).add(recipe.offset);
   for (let index = 0; index < (recipe.deref || 0); index++) {
-    address = Memory.readPointer(address);
+    address = address.readPointer();
   }
   return vg_read_mem(address, recipe.size || 8);
 }
@@ -153,7 +154,7 @@ function vg_install() {
             }
             vg_fill(args, callArgs, spec.args.length);
           } catch (error) {
-            VG_RUN[spec.id] = 'fill-error: ' + error;
+            VG_RUN[spec.id] = 'fill-error: ' + (error && error.stack ? error.stack : error);
             return;
           }
           try {
@@ -220,6 +221,8 @@ def install(patch_path: Path, pid: int | None, executable: Path | None,
     try:
         session = device.attach(pid)
         script = session.create_script(_script(patch, compiled, targets, bridge))
+        if os.environ.get('VG_DEBUG'):
+            script.on('message', lambda message, data: print('VG_SCRIPT', message, flush=True))
         script.load()
         result = script.exports_sync.install()
         if spawn:

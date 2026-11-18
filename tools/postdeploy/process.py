@@ -9,10 +9,37 @@ import subprocess
 import threading
 import time
 
-from runtime.frida.run import load_bundle
+try:
+    from runtime.frida.run import load_bundle
+except ImportError:
+    load_bundle = None
 
 ROOT = Path(__file__).resolve().parents[2]
 _LOG_SKIP = {'server.log', 'stderr.log'}
+
+
+def _install_dsl(pid: int, dsl_path: Path, bridge_dir: Path):
+    """Install a .vg patch through the current DSL -> VM -> Frida chain."""
+    import frida
+    from runtime.dsl import parser as dsl_parser
+    from runtime.dsl import resolve as dsl_resolve
+    from runtime.dsl import vm as dsl_vm
+    from runtime.dsl import vm_run
+
+    patch = dsl_parser.load(dsl_path)
+    dsl_resolve.resolve_patch(patch, pid=pid, executable=None)
+    globals_ = {}
+    for name in vm_run._global_names(patch):
+        _, address = dsl_resolve.resolve_global(name, pid, None, None)
+        globals_[name] = address
+    compiled = dsl_vm.compile_patch(patch, globals_)
+    targets = [vm_run._target_address(pid, mount, None) for mount in patch.mounts]
+    bridge = vm_run._bridge(bridge_dir)
+    session = frida.get_local_device().attach(pid)
+    script = session.create_script(vm_run._script(patch, compiled, targets, bridge))
+    script.load()
+    result = script.exports_sync.install()
+    return session, script, result, bridge
 
 
 def process_tree_fd_count(pid: int) -> int:
@@ -91,8 +118,12 @@ def sanitizer_subprocess_env() -> dict[str, str]:
 
 
 class Worker:
-    def __init__(self, command, directory, patch=None, catalog=None, timeout=20):
+    def __init__(self, command, directory, patch=None, catalog=None, dsl=None,
+                 bridge_dir=None, map_names=None, timeout=20):
         self.timeout = timeout
+        self.dsl = Path(dsl) if dsl else None
+        self.bridge_dir = Path(bridge_dir) if bridge_dir else ROOT / 'build' / 'frida-vm'
+        self.map_names = list(map_names or [])
         self.session = self.script = None
         self.events = []
         self.lines = queue.Queue()
@@ -122,6 +153,14 @@ class Worker:
 
     def _install(self, command, patch, catalog):
         self.receipt = {'pid': self.process.pid, 'command': list(map(str, command)), 'installed': False}
+        if self.dsl:
+            self.session, self.script, result, bridge = _install_dsl(
+                self.process.pid, self.dsl, self.bridge_dir)
+            self.receipt.update(result, backend='dsl-vm-frida',
+                                dsl=str(self.dsl), bridge=str(bridge),
+                                hashes={str(p): hashlib.sha256(p.read_bytes()).hexdigest()
+                                        for p in (self.dsl, bridge, Path(command[0]))})
+            return
         if patch:
             import frida
             config, actions = load_bundle(Path(patch), Path(catalog))
@@ -159,11 +198,15 @@ class Worker:
         if line is None: raise RuntimeError('worker exited: ' + str(self.process.poll()))
         reply = json.loads(line)
         self._record_request_resources(reply, fd_before, cursors)
-        if self.script:
+        if self.script and not self.dsl:
             self.script.exports_sync.barrier(self.serial)
             if self.barriers.get(timeout=self.timeout) != self.serial:
                 raise RuntimeError('event barrier mismatch')
         status = self.script.exports_sync.status() if self.script else None
+        if status is not None and self.map_names:
+            info = self.script.exports_sync.mapInfo()
+            used = int(info.get('used', 0))
+            status['map_sizes'] = {name: used for name in self.map_names}
         return {'outcome': reply, 'events': self.events[start:],
                 'runtime_status': status,
                 'elapsed_seconds': time.monotonic() - before}
