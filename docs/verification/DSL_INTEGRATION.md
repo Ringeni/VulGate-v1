@@ -88,7 +88,22 @@ CVE-2026-15176 installed through this path returns:
 ```
 
 The DSL installation itself works for nginx. The full declarative20 evaluation
-still stops earlier in the symbolic GOTO stage.
+still fails earlier in the symbolic GOTO stage when it must regenerate the
+paired GOTO. As a diagnostic bridge, VULGATE_REUSE_SYMBOLIC=<dir> can load a
+precomputed symbolic-verification.json.
+
+Using the original declarative20-results/CVE-2026-15176 symbolic result:
+
+`	ext
+installation: INSTALLED_AND_VERIFIED
+vm_bytecode_equivalence: PROVED
+action_and_caller_continuation: PROVED_IN_BOUNDED_DOMAIN
+target_vulnerability_elimination: PROVED_IN_BOUNDED_DOMAIN
+hooks triggered: 0/1
+`
+
+This proves the current DSL install and the rest of the evaluation pipeline can
+run for nginx; it does not prove the newly generated paired GOTO.
 
 ## Nginx attempt
 

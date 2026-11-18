@@ -9,6 +9,7 @@ import gzip
 import hashlib
 import http.server
 import json
+import os
 from pathlib import Path
 import random
 import re
@@ -3538,9 +3539,16 @@ def evaluate_case(vuln_spec_or_path: dict[str, Any] | Path,
                 case_ir['anchor_snapshot_error'] = 'not_captured'
         except Exception as exc:
             case_ir['anchor_snapshot_error'] = f'{type(exc).__name__}: {exc}'[-500:]
-    symbolic_report = build_and_verify_paired_goto_slice(
-        case_ir, vm_proofs, cbmc_bin, output_dir / 'symbolic' / 'paired_goto',
-    )
+    reuse_symbolic = os.environ.get('VULGATE_REUSE_SYMBOLIC')
+    if reuse_symbolic:
+        reused = Path(reuse_symbolic) / 'symbolic-verification.json'
+        if not reused.is_file():
+            raise FileNotFoundError(reused)
+        symbolic_report = json.loads(reused.read_text(encoding='utf-8'))
+    else:
+        symbolic_report = build_and_verify_paired_goto_slice(
+            case_ir, vm_proofs, cbmc_bin, output_dir / 'symbolic' / 'paired_goto',
+        )
     from .planner import extract_patch_footprint
     boundary_plan = symbolic_report.get('boundary_plan') or {}
     footprint = boundary_plan.get('patch_footprint') or extract_patch_footprint(
