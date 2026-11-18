@@ -3586,6 +3586,9 @@ def evaluate_case(vuln_spec_or_path: dict[str, Any] | Path,
     best_predicate_distances: dict[str, dict[str, float]] = {}
     poc_runtime_verification: dict[str, Any] | None = None
 
+    dsl_path = ROOT / 'runtime' / 'dsl' / 'patches' / (str(case_ir['case_id']) + '.vg')
+    if not dsl_path.is_file():
+        dsl_path = None
     with ExitStack() as stack:
         peer = stack.enter_context(UniversalBackendPeer()) if protocol in ('nginx_http', 'httpd_http') else None
         workers: dict[str, Any] = {}
@@ -3612,6 +3615,9 @@ def evaluate_case(vuln_spec_or_path: dict[str, Any] | Path,
                         command, directory,
                         patch=patch_manifest_path if patched else None,
                         catalog=actions_catalog_path,
+                        dsl=dsl_path if patched else None,
+                        bridge_dir=ROOT / 'build' / 'frida-vm',
+                        map_names=case_ir.get('empty_maps_after_episode'),
                     )
                 _track(mode, launch_brotli)
             elif protocol == 'cli_stream':
@@ -3658,6 +3664,9 @@ def evaluate_case(vuln_spec_or_path: dict[str, Any] | Path,
                         command, directory, spec,
                         patch=patch_manifest_path if patched else None,
                         catalog=actions_catalog_path,
+                        dsl=dsl_path if patched else None,
+                        bridge_dir=ROOT / 'build' / 'frida-vm',
+                        map_names=case_ir.get('empty_maps_after_episode'),
                     )
                 _track(mode, launch_php)
             else:
@@ -3690,6 +3699,9 @@ def evaluate_case(vuln_spec_or_path: dict[str, Any] | Path,
                         catalog=actions_catalog_path,
                         prepare=prep,
                         timeout=15,
+                        dsl=dsl_path if patched else None,
+                        bridge_dir=ROOT / 'build' / 'frida-vm',
+                        map_names=case_ir.get('empty_maps_after_episode'),
                     )
                 _track(mode, launch_http)
 

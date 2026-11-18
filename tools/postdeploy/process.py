@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[2]
 _LOG_SKIP = {'server.log', 'stderr.log'}
 
 
-def _install_dsl(pid: int, dsl_path: Path, bridge_dir: Path):
+def _install_dsl(pid: int, dsl_path: Path, bridge_dir: Path, session=None):
     """Install a .vg patch through the current DSL -> VM -> Frida chain."""
     import frida
     from runtime.dsl import parser as dsl_parser
@@ -35,7 +35,8 @@ def _install_dsl(pid: int, dsl_path: Path, bridge_dir: Path):
     compiled = dsl_vm.compile_patch(patch, globals_)
     targets = [vm_run._target_address(pid, mount, None) for mount in patch.mounts]
     bridge = vm_run._bridge(bridge_dir)
-    session = frida.get_local_device().attach(pid)
+    if session is None:
+        session = frida.get_local_device().attach(pid)
     script = session.create_script(vm_run._script(patch, compiled, targets, bridge))
     script.load()
     result = script.exports_sync.install()
@@ -155,8 +156,12 @@ class Worker:
         self.receipt = {'pid': self.process.pid, 'command': list(map(str, command)), 'installed': False}
         if self.dsl:
             self.session, self.script, result, bridge = _install_dsl(
-                self.process.pid, self.dsl, self.bridge_dir)
+                self.process.pid, self.dsl, self.bridge_dir, self.session)
+            hooks = result.get('installed') or []
             self.receipt.update(result, backend='dsl-vm-frida',
+                                installed=bool(hooks),
+                                guards=sum(1 for h in hooks if h.get('nature') == 'intercept'),
+                                observers=sum(1 for h in hooks if h.get('nature') == 'read_point'),
                                 dsl=str(self.dsl), bridge=str(bridge),
                                 hashes={str(p): hashlib.sha256(p.read_bytes()).hexdigest()
                                         for p in (self.dsl, bridge, Path(command[0]))})

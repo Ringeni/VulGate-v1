@@ -64,9 +64,13 @@ def transmit_http(connection, method, path, body, headers, chunk_size=None):
 
 
 class HTTPWorker(Worker):
-    def __init__(self, command, directory, trace_spec, patch=None, catalog=None, timeout=20, prepare=None):
+    def __init__(self, command, directory, trace_spec, patch=None, catalog=None, timeout=20, prepare=None,
+                 dsl=None, bridge_dir=None, map_names=None):
         import frida
         self.timeout = timeout
+        self.dsl = Path(dsl) if dsl else None
+        self.bridge_dir = Path(bridge_dir) if bridge_dir else (Path(__file__).resolve().parents[2] / 'build' / 'frida-vm')
+        self.map_names = list(map_names or [])
         self.session = self.script = self.control = None
         self.events, self.serial = [], 0
         self.barriers = queue.Queue()
@@ -122,11 +126,18 @@ class HTTPWorker(Worker):
             if self.control.exports_sync.finish(str(trace)) != 0:
                 raise RuntimeError('trace save failed')
             result.update(json.loads(trace.read_text()))
-            if self.script:
+            if self.script and not self.dsl:
                 self.script.exports_sync.barrier(self.serial)
                 if self.barriers.get(timeout=self.timeout) != self.serial:
                     raise RuntimeError('event barrier mismatch')
             status = self.script.exports_sync.status() if self.script else None
+            if status is not None and self.map_names:
+                try:
+                    info = self.script.exports_sync.mapInfo()
+                    used = int(info.get('used', 0))
+                except Exception:
+                    used = 0
+                status['map_sizes'] = {name: used for name in self.map_names}
         except Exception as error:
             if type(error).__name__ not in ('InvalidOperationError', 'TransportError'):
                 raise
