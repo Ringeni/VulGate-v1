@@ -17,7 +17,7 @@ def make(folder, cbmc):
         'workers': {mode: [str(folder / ('reference' if mode == 'reference' else 'baseline') / 'worker')]
                     for mode in ['baseline', 'patched', 'reference']},
         'adapter': 'experiments.postdeploy.brotli.corpus',
-        'dsl': str(ROOT / 'runtime/dsl/patches/CVE-2026-111497.vg'),
+        'dsl': str(ROOT / 'runtime/dsl/patches/CVE-2026-111497-single.vg'),
         'encoder': str(folder / 'encoder'), 'seed': 20261112, 'fuzz_cases': 24,
         'adaptive_cases': 12,
         'build_records': [str(folder / name) for name in ['build.json', 'binding.json', 'layout.json']] +

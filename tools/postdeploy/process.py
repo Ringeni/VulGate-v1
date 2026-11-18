@@ -204,8 +204,11 @@ class Worker:
                 raise RuntimeError('event barrier mismatch')
         status = self.script.exports_sync.status() if self.script else None
         if status is not None and self.map_names:
-            info = self.script.exports_sync.mapInfo()
-            used = int(info.get('used', 0))
+            try:
+                info = self.script.exports_sync.mapInfo()
+                used = int(info.get('used', 0))
+            except Exception:
+                used = 0
             status['map_sizes'] = {name: used for name in self.map_names}
         return {'outcome': reply, 'events': self.events[start:],
                 'runtime_status': status,
