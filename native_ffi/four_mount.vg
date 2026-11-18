@@ -1,0 +1,63 @@
+action A_MAP_NULL:
+{
+    return_type: pointer
+    return: 0
+}
+
+action A_DAV_405:
+{
+    return_type: int
+    return: 405
+}
+
+action A_500:
+{
+    return_type: int
+    return: 500
+}
+
+action A_NEG1:
+{
+    return_type: int
+    return: -1
+}
+
+mount map_uri:
+{
+    location: symbol="ngx_http_map_uri_to_path", args=[pointer, pointer, pointer], return=pointer
+    nature: intercept
+    behavior:
+    {
+        if (true) { return block("A_MAP_NULL"); }
+    }
+}
+
+mount dav_copy:
+{
+    location: symbol="ngx_http_dav_copy_move_handler", args=[pointer], return=int
+    nature: intercept
+    behavior:
+    {
+        if (true) { return block("A_DAV_405"); }
+    }
+}
+
+mount rewrite:
+{
+    location: symbol="ngx_http_rewrite_handler", args=[pointer], return=int
+    nature: intercept
+    behavior:
+    {
+        if (true) { return block("A_500"); }
+    }
+}
+
+mount regex:
+{
+    location: symbol="ngx_http_regex_exec", args=[pointer, pointer, pointer], return=int
+    nature: intercept
+    behavior:
+    {
+        if (true) { return block("A_NEG1"); }
+    }
+}

@@ -45,6 +45,8 @@ DSLs. 111497 installs its observer and guard on the same entry.
 | Check | Result |
 |---|---|
 | 10 x install/uninstall, nginx 15176 | all rc=0, nginx alive 200 |
+| 4 mounts in one nginx patch, 5 cycles | all rc=0, nginx alive 200 |
+| 7 hooks in one C fixture (4 same target) | all actions correct, restore works |
 | 32-thread load, INT3 42945 | 875 RPS, all 500, 0 errors |
 | 2-worker nginx, install on both pids | all COPY 405 |
 | uninstall after load | 302 |

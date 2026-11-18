@@ -101,6 +101,14 @@ static vg_target_entry *target_find(void *target)
     return NULL;
 }
 
+static vg_target_entry *target_find_any(void *target)
+{
+    for (unsigned i = 0; i < VG_INT3_MAX_TARGETS; i++) {
+        if (g_targets[i].target == target) return &g_targets[i];
+    }
+    return NULL;
+}
+
 static void target_write(vg_target_entry *entry, unsigned char byte)
 {
     patch_page(entry->target, PROT_READ | PROT_WRITE | PROT_EXEC);
@@ -134,13 +142,12 @@ static void target_release(void *target)
     if (!entry) return;
     if (--entry->refs == 0) {
         target_write(entry, entry->original);
-        memset(entry, 0, sizeof(*entry));
     }
 }
 
 static void target_suspend(void *target)
 {
-    vg_target_entry *entry = target_find(target);
+    vg_target_entry *entry = target_find_any(target);
     if (entry) target_write(entry, entry->original);
 }
 
@@ -242,6 +249,13 @@ static void trap_handler(int sig, siginfo_t *info, void *ucontext_raw)
         }
     }
     if (!matched) {
+        void *target = (void *)(ip - 1);
+        vg_target_entry *retired = target_find_any(target);
+        if (retired && *(unsigned char *)target == 0xCC) {
+            target_write(retired, retired->original);
+            uc->uc_mcontext.gregs[REG_RIP] = (greg_t)(uintptr_t)target;
+            return;
+        }
         if (g_old_trap.sa_sigaction) g_old_trap.sa_sigaction(sig, info, ucontext_raw);
         return;
     }

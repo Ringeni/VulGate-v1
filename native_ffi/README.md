@@ -70,6 +70,28 @@ Multiple hooks may share one entry. The SIGTRAP handler runs them in install
 order, so an observer can populate a map before a guard on the same function
 reads it. The original 111497 observer+guard pair now runs unchanged.
 
+Tested with `int3_multi4.c`:
+
+```text
+4 hooks on one target: 3 observers + 1 guard
+3 more hooks on distinct targets
+total: 7 hooks in one patch
+```
+
+Result:
+
+```text
+same target -> -73
+distinct targets -> -72, -71, -70
+after destroy -> original functions restored
+```
+
+A real 4-mount nginx patch (`four_mount.vg`) installs four different entries
+and returns 500 on the matching requests; five install/uninstall cycles leave
+nginx alive.
+
+## Replacements
+
 ## Replacements
 
 ```text
