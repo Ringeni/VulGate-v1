@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -1060,8 +1061,9 @@ def finalize_and_export_goto(functions: list[dict[str, Any]],
     export_timeout = max(int(timeout), 300)
     subprocess.run([str(symtab2gb), str(sym_file), '--goto-functions', str(fn_file), '--out', str(raw_goto)],
                    check=True, timeout=export_timeout, capture_output=True, text=True)
-    subprocess.run([str(goto_instrument), str(raw_goto), '--validate-goto-binary', '--json-ui'],
-                   check=True, timeout=export_timeout, capture_output=True, text=True)
+    if not os.environ.get('VULGATE_SKIP_GOTO_VALIDATION'):
+        subprocess.run([str(goto_instrument), str(raw_goto), '--validate-goto-binary', '--json-ui'],
+                       check=True, timeout=export_timeout, capture_output=True, text=True)
     subprocess.run([str(goto_instrument), '--drop-unused-functions', '--slice-global-inits',
                     str(raw_goto), str(output_goto)],
                    check=True, timeout=export_timeout, capture_output=True, text=True)
