@@ -94,13 +94,13 @@ precomputed symbolic-verification.json.
 
 Using the original declarative20-results/CVE-2026-15176 symbolic result:
 
-`	ext
+``	ext
 installation: INSTALLED_AND_VERIFIED
 vm_bytecode_equivalence: PROVED
 action_and_caller_continuation: PROVED_IN_BOUNDED_DOMAIN
 target_vulnerability_elimination: PROVED_IN_BOUNDED_DOMAIN
 hooks triggered: 0/1
-`
+``
 
 This proves the current DSL install and the rest of the evaluation pipeline can
 run for nginx; it does not prove the newly generated paired GOTO.
@@ -126,5 +126,5 @@ or in the current transport path, not in the installed tool binaries.
 
 1. Fix generated typed GOTO width encoding for nginx.
 2. Add DSL event snapshots for monitor replay.
-3. Run one nginx case end-to-end.
-4. Port the same DSL installation path to declarative20 app profiles.
+3. Run one nginx case without precomputed symbolic reuse.
+4. Port the same DSL installation path to all declarative20 app profiles.
