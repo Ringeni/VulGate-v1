@@ -76,6 +76,20 @@ address.readU8() / readU16() / readU32() / readU64() / readPointer()
 instead of the removed `Memory.readU8` family. This is required for caller
 locals and callsite observers on the installed Frida version.
 
+## Nginx installation
+
+`tools/postdeploy/http_process.py` and `evaluate.py` now pass the case's
+`runtime/dsl/patches/<case>.vg` to the HTTP workers. A direct nginx check with
+CVE-2026-15176 installed through this path returns:
+
+```text
+/plain          -> 200
+/files/file.txt -> 500
+```
+
+The DSL installation itself works for nginx. The full declarative20 evaluation
+still stops earlier in the symbolic GOTO stage.
+
 ## Nginx attempt
 
 The generated 20-case specs and nginx 1.29.6/1.31.6/1.31.7 builds/sources were
