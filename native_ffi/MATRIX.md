@@ -24,7 +24,7 @@ All mounts use the independent INT3 engine; there is no Frida hook fallback.
 | 17 | CVE-2026-97205 | nginx | `ngx_http_copy_filter` (INT3) | SSI + proxy_store + aio_write | 000; guard run=1 |
 | 18 | CVE-2026-109618 | PHP | `rfc1867_post_handler` | multipart upload | files empty |
 | 19 | CVE-2026-109619 | PHP | `php_session_rfc1867_callback` | fresh PHPSESSID progress upload | files normal, progress=false |
-| 20 | CVE-2026-111497 | brotli | single-entry `WriteRingBuffer` | real worker | error=-9, produced=0 |
+| 20 | CVE-2026-111497 | brotli | observer + guard on `WriteRingBuffer` | real worker | error=-9, produced=0 |
 
 ## INT3 install coverage
 
@@ -37,8 +37,8 @@ php 2:    109618 109619
 brotli 1: 111497
 ```
 
-`ffi_run.py` maps 93479 to the coarse rewrite patch and 111497 to the
-single-entry form; the rest use the original DSLs.
+`ffi_run.py` maps 93479 to the coarse rewrite patch; the rest use the original
+DSLs. 111497 installs its observer and guard on the same entry.
 
 ## Extreme-condition checks
 
@@ -65,8 +65,6 @@ The nginx and brotli checks use `LD_PRELOAD` drivers, not Frida.
 
 ## Notes
 
-- The 111497 single-entry form combines the observer and guard because this
-  INT3 engine supports one trap per entry.
 - 42533 / 60005 / 97205 execute BLOCK but the target function does not map that
   return value to a standard HTTP 500/503.
 - 47360's final status depends on the request path; the guard itself runs.

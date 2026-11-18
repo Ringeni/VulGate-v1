@@ -64,16 +64,20 @@ Subhook, and Dobby failed to execute their replacement.
 - bounded `for`;
 - release build.
 
+## Multi-hook targets
+
+Multiple hooks may share one entry. The SIGTRAP handler runs them in install
+order, so an observer can populate a map before a guard on the same function
+reads it. The original 111497 observer+guard pair now runs unchanged.
+
 ## Replacements
 
 ```text
 CVE-2026-93479 -> runtime/dsl/patches_alt/CVE-2026-93479-rewrite.vg
-CVE-2026-111497 -> native_ffi/patches/CVE-2026-111497-single.vg
 ```
 
 The 93479 fine-grained action still hangs; the replacement is a safe coarse
-return at `ngx_http_rewrite_handler`. The 111497 single-hook form combines the
-observer and guard because INT3 supports one trap per entry.
+return at `ngx_http_rewrite_handler`.
 
 ## Local preload verification
 
@@ -102,6 +106,22 @@ nginx 1.31.6, BLOCK 42945, 32 threads:
 
 INT3 is in the same range as Frida; the third load window expired and is not
 used.
+
+## Hot-patch behavior
+
+Writing `0xCC` does not suspend the process. Threads already inside the
+function continue; only a thread that fetches the patched entry traps into the
+SIGTRAP handler. The handler runs the VM and either returns the action or
+single-steps the original instruction.
+
+The install order is: install SIGTRAP handler, publish hook, write `0xCC`,
+serialize. Uninstall sets the hook inactive, restores the original byte, and
+removes the target reference.
+
+This is not a stop-the-world patcher. Patching/unpatching while another thread
+is entering the target is inherently racy; a production deployment that
+requires strict atomicity should quiesce threads around install/uninstall or
+use a dedicated patching agent.
 
 ## Current limits
 

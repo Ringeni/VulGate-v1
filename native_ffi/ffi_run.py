@@ -100,7 +100,6 @@ FRIDA_FALLBACK_SYMBOLS = set()
 
 COARSE_REPLACEMENTS = {
     'CVE-2026-93479': ROOT / 'runtime' / 'dsl' / 'patches_alt' / 'CVE-2026-93479-rewrite.vg',
-    'CVE-2026-111497': ROOT / 'native_ffi' / 'patches' / 'CVE-2026-111497-single.vg',
 }
 
 
