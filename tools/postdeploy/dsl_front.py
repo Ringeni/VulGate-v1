@@ -66,8 +66,14 @@ def derive_patch_spec(vg_path: Path | str, base_patch: dict[str, Any] | None = N
     derived['schema'] = derived.get('schema') or 'vulgate.patch/v2'
     derived['maps'] = {name: {'capacity': int(spec.capacity)} for name, spec in patch.maps.items()}
     derived['observers'] = []
-    derived['guards'] = [_guard_spec(mount) for mount in patch.mounts if mount.nature != '读取点']
+    derived['guards'] = [
+        _guard_spec(mount) for mount in patch.mounts
+        if mount.nature not in ('读取点', 'read_point')]
     derived['actions'] = {name: _action_spec(spec) for name, spec in patch.actions.items()}
+    # Every mount in the .vg is installed by the DSL chain, so the hook count
+    # the installation receipt must match is the mount count (the legacy
+    # mapping only knows guards, not read-point observers).
+    derived['install_hook_count'] = len(patch.mounts)
     derived['dsl_patch'] = {
         'path': str(vg_path.resolve()),
         'sha256': hashlib.sha256(vg_path.read_bytes()).hexdigest(),

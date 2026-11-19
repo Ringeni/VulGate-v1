@@ -889,6 +889,8 @@ def compile_case(vuln_spec: dict[str, Any],
     if dsl_patch:
         case_ir['identities']['dsl_patch_sha256'] = dsl_patch.get('sha256')
         case_ir['deployment']['dsl_patch'] = dsl_patch.get('path')
+        if patch_spec.get('install_hook_count') is not None:
+            case_ir['deployment']['install_hook_count'] = int(patch_spec['install_hook_count'])
     sym_scope = dict(vuln_spec.get('symbolization_scope', {}))
     if 'field_to_input_map' in sym_scope and isinstance(sym_scope['field_to_input_map'], dict):
         fmap = dict(sym_scope['field_to_input_map'])

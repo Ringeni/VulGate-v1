@@ -3984,7 +3984,11 @@ def evaluate_case(vuln_spec_or_path: dict[str, Any] | Path,
     nonempty_regs = [i for i, r in enumerate(sym_regs) if r.get('classification') != 'UNREACHABLE']
     impact_regs = [i for i, r in enumerate(sym_regs) if r.get('classification') in ('CHANGED_BY_BLOCK', 'CHANGED_ON_PASS', 'MIXED')]
 
-    total_required_hooks = len(case_ir['guards']) + len(case_ir['observers'])
+    # DSL-sourced cases install every mount of the .vg (guards plus read-point
+    # observers); the legacy mapping only counts guards and observers.
+    total_required_hooks = int(
+        (case_ir.get('deployment') or {}).get('install_hook_count')
+        or (len(case_ir['guards']) + len(case_ir['observers'])))
     installed_hooks_count = int(installation_receipt.get('guards', 0)) + int(installation_receipt.get('observers', 0))
     (output_dir / 'installation-receipt.json').write_text(
         json.dumps(installation_receipt, indent=2, ensure_ascii=False) + '\n',

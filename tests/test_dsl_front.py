@@ -37,6 +37,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from tools.postdeploy import dsl_front  # noqa: E402
+from runtime.dsl import parser as dsl_parser  # noqa: E402
 from tools.postdeploy.case_compiler import compile_case, load_spec_file, sha256_file  # noqa: E402
 from tools.postdeploy.expressions import compile_guard  # noqa: E402
 from tools.postdeploy.obligations import _selector_c_expr  # noqa: E402
@@ -211,3 +212,16 @@ def test_111497_single_fusion_divergence(tmp_path: Path) -> None:
     assert 'sample_present' not in dsl_guard['policy_source']
     assert 'sample_present == 0' in yaml_guard['policy_source']
     assert dsl_guard['bytecode_sha256'] != DSL_BYTECODE_SHA256['CVE-2026-111497']
+
+def test_install_hook_count_matches_vg_mounts() -> None:
+    """The main chain installs every mount of the .vg, so the receipt's
+    required-hook count must be the DSL mount count, not the legacy
+    guard+observer count (the mapping only carries guards)."""
+    for case_id, expected in (('CVE-2026-15176', 1), ('CVE-2026-111497', 2)):
+        path = dsl_front.patch_path(case_id)
+        assert path is not None
+        derived = dsl_front.derive_patch_spec(path)
+        assert derived['install_hook_count'] == len(dsl_parser.load(path).mounts) == expected
+
+    single = dsl_front.derive_patch_spec(DSL_PATCHES / 'CVE-2026-111497-single.vg')
+    assert single['install_hook_count'] == 1
