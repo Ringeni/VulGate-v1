@@ -46,6 +46,7 @@ from .case_compiler import (
     snapshot_predicate_distances,
 )
 from .coverage import edges as trace_edges, summarize as summarize_coverage
+from .dsl_front import derive_patch_spec, patch_path as dsl_patch_path
 from .http_process import HTTPWorker
 from .monitors import VMReplay
 from .obligations import build_and_verify_paired_goto_slice, prescan_static_globals, verify_vm_bytecode_equivalence
@@ -3491,6 +3492,12 @@ def evaluate_case(vuln_spec_or_path: dict[str, Any] | Path,
             cbmc_bin = Path('/home/vita/vulgate-full-typed-cold-backend-20261105-v1/toolchain-bin/cbmc')
         else:
             cbmc_bin = Path('/mnt/d/Codex/2026-11-03/goal-042fb9fb-01ec-4a00-960b-c95a63665f9e/work/general-implementation/reproducible-toolchain-v3/cbmc/usr/bin/cbmc')
+
+    case_id = str(vuln_spec.get('case_id') or '')
+    case_dsl_patch = dsl_patch_path(case_id) if case_id else None
+    if case_dsl_patch is not None:
+        # Guard/action/map model comes from the same .vg the main chain installs.
+        patch_spec = derive_patch_spec(case_dsl_patch, patch_spec)
 
     case_ir = compile_case(vuln_spec, patch_spec, app_profile, output_dir)
     ensure_poc_alias_files(case_ir)

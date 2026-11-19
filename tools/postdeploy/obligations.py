@@ -839,7 +839,11 @@ def _selector_c_expr(sel: dict[str, Any], param_names: list[str], w1_prefix: str
         idx = int(sel['arg'])
         base = f'((uintptr_t)({param_names[idx]}))'
     elif 'global' in sel:
-        raise ValueError('raw ELF offset global selector requires symbol name or c_expr for source-level GOTO')
+        global_ref = sel['global'] if isinstance(sel['global'], dict) else {}
+        symbol = global_ref.get('symbol_c_name')
+        if not symbol:
+            raise ValueError('raw ELF offset global selector requires symbol name or c_expr for source-level GOTO')
+        base = f'((uintptr_t)(void *)&{symbol})'
     elif 'constant' in sel:
         base = f'UINT64_C({int(sel["constant"])})'
     else:
@@ -1912,6 +1916,11 @@ def build_and_verify_paired_goto_slice(case_ir: dict[str, Any],
         for f_name, f_bind in g['fields'].items():
             if 'constant' in f_bind:
                 sel_assigns.append(f'uint64_t __vg_f_{f_name} = UINT64_C({int(f_bind["constant"])});')
+            elif f_bind['source'] == 'reg':
+                # Caller-local selector: the guard reads a register slot.  The
+                # symbolic domain treats the local as a free input.
+                sel_assigns.append(f'uint64_t __vg_f_{f_name} = __vulgate_nondet_u64();')
+                sel_assigns.append(f'ctx.regs[{int(f_bind["index"])}] = __vg_f_{f_name};')
             elif f_bind['source'] == 'arg':
                 raw_s = list(g['selectors'].values())[f_bind['index']]
                 if raw_s.get('reads'):

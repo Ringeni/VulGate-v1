@@ -287,7 +287,8 @@ def _resolve_selector_spec(raw_sel: dict[str, Any],
         sel.pop('module', None)
         if gsym not in symbol_tables[gmod]:
             raise ValueError(f'global symbol {gsym} missing or ambiguous in {gmod}')
-        sel['global'] = {'module': gmod, 'offset': symbol_tables[gmod][gsym]}
+        sel['global'] = {'module': gmod, 'offset': symbol_tables[gmod][gsym],
+                         'symbol_c_name': gsym}
     resolved_reads = []
     for step in sel.get('reads', []):
         rstep = dict(step)
@@ -528,6 +529,7 @@ def compile_case(vuln_spec: dict[str, Any],
     output_dir.mkdir(parents=True, exist_ok=True)
     deploy_dir = output_dir / 'deployment'
     deploy_dir.mkdir(parents=True, exist_ok=True)
+    dsl_patch = patch_spec.get('dsl_patch') or {}
 
     exe_path = _resolve_artifact(app_profile, None, 'baseline')
     all_modules: dict[str, Path] = {exe_path.name: exe_path}
@@ -643,16 +645,24 @@ def compile_case(vuln_spec: dict[str, Any],
         vm_args: list[dict[str, Any]] = []
         fields: dict[str, dict[str, Any]] = {}
         selector_names: list[str] = []
+        reg_index = 0
         raw_selectors = g.get('selectors', {})
         if isinstance(raw_selectors, dict):
             items = list(raw_selectors.items())
         else:
             items = [(s['name'], s) for s in raw_selectors]
-        if len(items) > 6:
+        # Caller-local selectors bind VM registers, not VM arguments.
+        if len([item for item in items if 'local' not in item[1]]) > 6:
             raise ValueError(f'guard {g["id"]} exceeds 6 VM argument selectors')
 
         for idx, (sname, sdef) in enumerate(items):
             resolved_sel = _resolve_selector_spec(sdef, symbol_tables, mod_name, dwarf, layout_overrides)
+            if 'local' in resolved_sel:
+                if resolved_sel.get('reads'):
+                    raise ValueError(f'guard {g["id"]} local selector cannot carry reads')
+                fields[sname] = {'source': 'reg', 'index': reg_index}
+                reg_index += 1
+                continue
             if 'constant' in resolved_sel and not resolved_sel.get('reads') and not g.get('force_vm_arg_constant'):
                 fields[sname] = {'constant': int(resolved_sel['constant'])}
             else:
@@ -779,7 +789,7 @@ def compile_case(vuln_spec: dict[str, Any],
             guard_manifest_entry['return_offsets'] = [int(x) for x in g['return_offsets']]
 
         guards_manifest.append(guard_manifest_entry)
-        compiled_guards_ir.append({
+        guard_ir = {
             'id': g['id'],
             'function': fn,
             'source_file': g.get('source_file'),
@@ -800,7 +810,14 @@ def compile_case(vuln_spec: dict[str, Any],
             'action_id': action_id,
             'resolved_action': raw_action,
             'step_limit': int(g.get('step_limit', 4096)),
-        })
+        }
+        if dsl_patch:
+            guard_ir.update({
+                'rule_source': 'dsl',
+                'dsl_patch': dsl_patch.get('path'),
+                'dsl_patch_sha256': dsl_patch.get('sha256'),
+            })
+        compiled_guards_ir.append(guard_ir)
 
     source_root = ((app_profile.get('builds') or {}).get('baseline') or {}).get('source_dir')
     action_catalog_extraction = attest_catalog(
@@ -848,6 +865,7 @@ def compile_case(vuln_spec: dict[str, Any],
             'actions_catalog': str(actions_json_path),
             'bridge': str(bridge_path),
             'quiescent_phase': deployment_quiescent_phase(patch_spec, app_profile),
+            'patch_source': 'dsl' if dsl_patch else 'yaml',
         },
         'maps': patch_spec.get('maps', {}),
         'observers': observers_manifest,
@@ -868,6 +886,9 @@ def compile_case(vuln_spec: dict[str, Any],
         'app_profile': app_profile,
         'action_catalog_extraction': action_catalog_extraction,
     }
+    if dsl_patch:
+        case_ir['identities']['dsl_patch_sha256'] = dsl_patch.get('sha256')
+        case_ir['deployment']['dsl_patch'] = dsl_patch.get('path')
     sym_scope = dict(vuln_spec.get('symbolization_scope', {}))
     if 'field_to_input_map' in sym_scope and isinstance(sym_scope['field_to_input_map'], dict):
         fmap = dict(sym_scope['field_to_input_map'])
