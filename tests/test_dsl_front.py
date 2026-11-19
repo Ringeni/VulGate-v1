@@ -225,3 +225,15 @@ def test_install_hook_count_matches_vg_mounts() -> None:
 
     single = dsl_front.derive_patch_spec(DSL_PATCHES / 'CVE-2026-111497-single.vg')
     assert single['install_hook_count'] == 1
+
+def test_every_main_chain_patch_derives_a_guard_model() -> None:
+    """The verify chain must be able to derive *every* installed .vg patch, not
+    just the two exercised end-to-end cases."""
+    patches = sorted(DSL_PATCHES.glob('*.vg'))
+    assert len(patches) >= 20
+    for path in patches:
+        derived = dsl_front.derive_patch_spec(path)
+        assert derived['install_hook_count'] == len(dsl_parser.load(path).mounts) >= 1, path.name
+        assert derived['guards'], path.name
+        for guard in derived['guards']:
+            assert guard['action_id'] in derived['actions'], (path.name, guard['id'])
