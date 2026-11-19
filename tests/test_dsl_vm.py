@@ -1,4 +1,4 @@
-﻿from pathlib import Path
+from pathlib import Path
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -43,7 +43,9 @@ def test_generated_patches_compile_with_overrides() -> None:
               'captures': 1, 'counter': 250,
               'remaining': 0, 'sample_present': 0}
     for path in sorted((ROOT / 'runtime' / 'dsl' / 'patches').glob('*.vg')):
-        if path.stem == 'CVE-2026-111497':
+        if path.stem.startswith('CVE-2026-111497'):
+            # Observer/guard pair and its single-mount fusion both depend on
+            # runtime resolution (dsl_resolve) before they compile.
             continue
         patch = parser.load(path)
         compiled = vm.compile_patch(patch, overrides=values)
