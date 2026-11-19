@@ -15,5 +15,3 @@ targets/linux_userspace/request_parser
 eval/
 build/
 .venv/
-AGENTS.md
-CLAUDE.md
