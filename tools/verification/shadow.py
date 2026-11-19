@@ -129,8 +129,11 @@ def _allocator_shadow_marks(called, result, arguments, donor, functions, symbols
     size_type = params[1].get("namedSub", {}).get("type") or {"id": "unsignedbv", "namedSub": {"width": {"id": "64"}}}
     for index in indexes[1:]:
         size = {"id": "*", "namedSub": {"type": deepcopy(size_type)}, "sub": [size, deepcopy(args[index])]}
-    pointer_type = params[0].get("namedSub", {}).get("type") or {"id": "pointer"}
-    dirty_type = params[2].get("namedSub", {}).get("type") or {"id": "c_bool"}
+    # Fallbacks must stay well-formed for CBMC validation: every bitvector
+    # type needs an explicit width (pointer 64, C bool 8 in this model).
+    pointer_type = params[0].get("namedSub", {}).get("type") or {
+        "id": "pointer", "namedSub": {"width": {"id": "64"}}, "sub": [{"id": "empty"}]}
+    dirty_type = params[2].get("namedSub", {}).get("type") or {"id": "c_bool", "namedSub": {"width": {"id": "8"}}}
     dirty = {"id": "constant", "namedSub": {"type": deepcopy(dirty_type), "value": {"id": "0" if zeroing else "1"}}}
     call = fresh(located({
         "instructionId": "FUNCTION_CALL",

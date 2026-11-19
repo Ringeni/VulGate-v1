@@ -705,8 +705,11 @@ def _output_pointer_argument(symbols: dict[str, Any], name: str, form: str, para
         'type': deepcopy(local['type']),
     }}
     if form == 'object':
+        # A pointer type must carry the target's pointer width: CBMC rejects a
+        # bitvector type without width when the exported GOTO is validated.
+        pointer_width = deepcopy((param_type.get('namedSub') or {}).get('width') or {'id': '64'})
         expr = {'id': 'address_of', 'namedSub': {'type': {
-            'id': 'pointer', 'sub': [deepcopy(local['type'])],
+            'id': 'pointer', 'namedSub': {'width': pointer_width}, 'sub': [deepcopy(local['type'])],
         }}, 'sub': [expr]}
     return {'id': 'typecast', 'namedSub': {'type': deepcopy(param_type)}, 'sub': [expr]}
 
