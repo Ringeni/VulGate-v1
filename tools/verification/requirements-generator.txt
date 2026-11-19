@@ -1,2 +1,0 @@
-# Optional; offline discovery, synthesis and verification do not use this SDK.
-openai>=2,<3
