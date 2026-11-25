@@ -66,4 +66,34 @@ def test_map_observer_compiles() -> None:
     assert compiled.mounts[1].action_id == 'REJECT'
 
 
+def test_nested_reads_and_rhs_binary_use_scratch_without_clobber() -> None:
+    text = '''
+action DENY:
+{
+    return_type: int
+    return: -1
+}
+
+mount nested:
+{
+    location: symbol="target_fn", args=[pointer, uint64], return=int
+    nature: intercept
+    behavior:
+    {
+        value["clcf"] = vg_read_pointer(vg_read_pointer(arg0 + 40) + vg_read_u64(global("mod") + 0) * 8);
+        value["cnt"] = vg_read_u32(value["clcf"] + 16);
+        if ((value["cnt"] & 255) >= (250 * 1) && value["cnt"] <= 0x80000000) {
+            return block("DENY");
+        }
+    }
+}
+'''
+    compiled = vm.compile_patch(parser.parse(text), {'mod': 0x555555601234})
+    code = compiled.mounts[0].code
+    assert code and len(code) % 8 == 0
+    rows = [code[i:i + 8] for i in range(0, len(code), 8)]
+    assert any(row[0] == vm.OP_CALL and int.from_bytes(row[4:8], 'little', signed=True) == vm.HELPER_SCRATCH_STORE for row in rows)
+    assert any(row[0] == vm.OP_MOV_K32 for row in rows)
+
+
 

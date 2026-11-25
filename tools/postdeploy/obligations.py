@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import ast
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
+import gc
 import json
+import os
 from pathlib import Path
 import re
+import shutil
 import struct
 import subprocess
 import time
@@ -15,7 +19,23 @@ from tools.verification.source import functions as parse_c_functions
 from tools.verification.typed_transport import FULL, TransportError
 from .expressions import c_expression, evaluate, parse, policy_reference_c, predicates
 from .driver_synth import synthesize_paired_goto_driver_c
-from .paired_goto import apply_paired_weaves, clone_dual_world_goto, finalize_and_export_goto
+from .hybrid_exec import (
+    HYBRID_STAGE_TIMEOUT_SEC,
+    NO_HAZARD_ON_SEARCHED_POINTS,
+    apply_searched_point_claim,
+    concrete_neighborhood,
+    input_domains,
+    run_hybrid_neighborhood,
+    searched_neighborhood_record,
+    successful_assertion_names,
+)
+from .paired_goto import (
+    VERIBIN_LOOP_UNWIND,
+    apply_paired_weaves,
+    apply_veribin_summaries,
+    clone_dual_world_goto,
+    finalize_and_export_goto,
+)
 from .planner import (
     _reachable_from,
     build_enhanced_icfg,
@@ -26,7 +46,7 @@ from .planner import (
     resolve_ir_function_names,
     static_globals_referenced,
 )
-from .snapshot_lifter import lift_snapshot_to_abstract_spec
+from .snapshot_lifter import bind_accessed_members, lift_snapshot_to_abstract_spec
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNTIME_EXPERIMENT = ROOT / 'runtime/experiment'
@@ -212,9 +232,56 @@ def _cbmc_entry_flags(entry: str) -> list[str]:
     return ['--function', entry]
 
 
+def _nginx_script_run_unwind_flags(case_ir: dict[str, Any]) -> list[str]:
+    return []
+
+
+def _coalesce_unwindset(cmd: list[str]) -> list[str]:
+    kept: list[str] = []
+    parts: list[str] = []
+    index = 0
+    while index < len(cmd):
+        item = cmd[index]
+        if item == '--unwindset' and index + 1 < len(cmd):
+            parts.extend(piece for piece in cmd[index + 1].split(',') if piece)
+            index += 2
+            continue
+        kept.append(item)
+        index += 1
+    if not parts:
+        return kept
+    chosen: dict[str, str] = {}
+    order: list[str] = []
+    for piece in parts:
+        key, sep, _bound = piece.rpartition(':')
+        if not sep or not key:
+            continue
+        if key not in chosen:
+            order.append(key)
+        chosen[key] = piece
+    insert_at = len(kept)
+    for pos, item in enumerate(kept):
+        if item == '--unwind' and pos + 1 < len(kept):
+            insert_at = pos + 2
+            break
+    merged = ','.join(chosen[key] for key in order)
+    return [*kept[:insert_at], '--unwindset', merged, *kept[insert_at:]]
+
+
 def _obligation_query_flags(case_ir: dict[str, Any]) -> list[str]:
     from .oracle_compiler import arithmetic_query_flags
     return [*_cbmc_entry_flags('__vg_verify_obligations'), *arithmetic_query_flags(case_ir)]
+
+
+def _noshadow_assertion_flags(case_ir: dict[str, Any]) -> list[str]:
+    kind = str((case_ir.get('safety_oracle') or {}).get('kind') or '')
+    if kind in ('logical_region_bounds', 'temporal_object_validity', 'state_invariant'):
+        return ['--vg-user-assertions-only']
+    return []
+
+
+def _noshadow_query_flags(case_ir: dict[str, Any]) -> list[str]:
+    return ['--vg-noshadow-query', *_noshadow_assertion_flags(case_ir)]
 
 
 def _slice_compile_flags(case_ir: dict[str, Any]) -> tuple[list[Path], list[str]]:
@@ -339,10 +406,36 @@ def prescan_static_globals(case_ir: dict[str, Any], cbmc_bin: Path, output_dir: 
     return static_globals_referenced(functions, symbols, subtree)
 
 
+def shrink_query_goto(src: Path, goto_instrument: Path, dest_dir: Path) -> Path:
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    current = Path(src)
+    dropped = dest_dir / 'dropped.goto'
+    try:
+        proc = subprocess.run(
+            [str(goto_instrument), '--drop-unused-functions', str(current), str(dropped)],
+            timeout=180, capture_output=True, text=True,
+        )
+        if proc.returncode == 0 and dropped.is_file() and dropped.stat().st_size > 0:
+            current = dropped
+    except (subprocess.TimeoutExpired, OSError):
+        return Path(src)
+    sliced = dest_dir / 'sliced.goto'
+    try:
+        proc = subprocess.run(
+            [str(goto_instrument), '--reachability-slice', '--slice-global-inits', str(current), str(sliced)],
+            timeout=180, capture_output=True, text=True,
+        )
+        if proc.returncode == 0 and sliced.is_file() and sliced.stat().st_size > 0:
+            current = sliced
+    except (subprocess.TimeoutExpired, OSError):
+        return current
+    return current
+
+
 def initial_object_bits(driver_text: str) -> int:
     count = len(set(re.findall(r'__vulgate_snap_w0_obj_[A-Za-z0-9_]+', driver_text)))
     if count >= 40:
-        return 14
+        return 12
     if count >= 16:
         return 11
     return 8
@@ -354,41 +447,111 @@ def _wider_object_bits(reason: str, object_bits: int) -> int | None:
     return min(14, object_bits + 3)
 
 
+def _spawn_memory_limit(memory_bytes: int | None):
+    if not memory_bytes or os.name == 'nt':
+        return None
+
+    def _limit() -> None:
+        try:
+            import resource
+            resource.setrlimit(resource.RLIMIT_AS, (int(memory_bytes), int(memory_bytes)))
+        except (ImportError, OSError, ValueError):
+            return
+
+    return _limit
+
+
+def _load_cbmc_messages(path: Path) -> list[Any]:
+    decoder = json.JSONDecoder()
+    messages: list[Any] = []
+    pending = ''
+    with path.open(encoding='utf-8') as handle:
+        while True:
+            chunk = handle.read(1 << 20)
+            pending += chunk
+            while True:
+                pending = pending.lstrip()
+                if not pending:
+                    break
+                if pending[0] in '[,]' :
+                    pending = pending[1:]
+                    continue
+                if pending[0] == ']':
+                    return messages
+                try:
+                    message, index = decoder.raw_decode(pending)
+                except json.JSONDecodeError:
+                    break
+                if isinstance(message, dict):
+                    results = message.get('result')
+                    if isinstance(results, list):
+                        for prop in results:
+                            if isinstance(prop, dict) and prop.get('status') != 'FAILURE':
+                                prop.pop('trace', None)
+                messages.append(message)
+                pending = pending[index:]
+            if not chunk:
+                break
+    if pending.strip() not in ('', ']'):
+        raise json.JSONDecodeError('truncated cbmc output', pending[:80], 0)
+    return messages
+
+
 def _run_cbmc_json_once(goto_binary: Path,
                    cbmc_bin: Path,
                    work_dir: Path,
                    unwind: int = 32,
                    object_bits: int = 8,
                    timeout: int = 120,
-                   extra_flags: list[str] | None = None) -> dict[str, Any]:
+                   extra_flags: list[str] | None = None,
+                   memory_bytes: int | None = None) -> dict[str, Any]:
     work_dir = Path(work_dir).resolve()
     work_dir.mkdir(parents=True, exist_ok=True)
+    supplied = [
+        flag for flag in (extra_flags or [])
+        if flag not in ('--vg-user-assertions-only', '--vg-noshadow-query')
+    ]
+    user_assertions_only = '--vg-user-assertions-only' in (extra_flags or [])
+    noshadow_query = user_assertions_only or '--vg-noshadow-query' in (extra_flags or [])
+    safety_checks = [
+        '--div-by-zero-check',
+        '--signed-overflow-check',
+        '--undefined-shift-check',
+    ]
+    if not user_assertions_only:
+        safety_checks = [
+            '--bounds-check',
+            '--pointer-check',
+            '--pointer-overflow-check',
+            *safety_checks,
+        ]
     cmd = [
         str(cbmc_bin),
         str(goto_binary),
         '--json-ui',
         '--trace',
         '--unwind', str(unwind),
+        *( [] if noshadow_query else ['--unwindset', '__vg_mark_alloc.0:8192'] ),
         '--object-bits', str(object_bits),
         '--unwinding-assertions',
-        '--bounds-check',
-        '--pointer-check',
-        '--pointer-overflow-check',
-        '--div-by-zero-check',
-        '--signed-overflow-check',
-        '--undefined-shift-check',
+        *safety_checks,
         '--slice-formula',
         '--verbosity', '1',
-        *(extra_flags or []),
+        *supplied,
     ]
+    cmd = _coalesce_unwindset(cmd)
     (work_dir / 'command.json').write_text(json.dumps(cmd, indent=2) + '\n', encoding='utf-8')
     stdout_path = work_dir / 'stdout.json'
     stderr_path = work_dir / 'stderr.log'
     started = time.monotonic()
     try:
         with stdout_path.open('w', encoding='utf-8') as out, stderr_path.open('w', encoding='utf-8') as err:
-            proc = subprocess.run(cmd, stdout=out, stderr=err, timeout=timeout)
-        messages = json.loads(stdout_path.read_text(encoding='utf-8'))
+            proc = subprocess.run(
+                cmd, stdout=out, stderr=err, timeout=timeout,
+                preexec_fn=_spawn_memory_limit(memory_bytes),
+            )
+        messages = _load_cbmc_messages(stdout_path)
+        stdout_path.unlink(missing_ok=True)
     except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as exc:
         return {
             'status': 'unresolved',
@@ -430,13 +593,19 @@ def _run_cbmc_json(goto_binary: Path,
                    unwind: int = 32,
                    object_bits: int = 8,
                    timeout: int = 120,
-                   extra_flags: list[str] | None = None) -> dict[str, Any]:
+                   extra_flags: list[str] | None = None,
+                   memory_bytes: int | None = None) -> dict[str, Any]:
     bits = object_bits
+    if extra_flags and '--vg-user-assertions-only' in extra_flags:
+        bits = max(bits, 11)
+        if memory_bytes is None:
+            memory_bytes = 24 * 1024 * 1024 * 1024
     directory = Path(work_dir)
     while True:
         result = _run_cbmc_json_once(
             goto_binary, cbmc_bin, directory,
             unwind=unwind, object_bits=bits, timeout=timeout, extra_flags=extra_flags,
+            memory_bytes=memory_bytes,
         )
         wider = _wider_object_bits(str(result.get('reason') or ''), bits)
         if wider is None:
@@ -573,6 +742,8 @@ def counterexample_site(prop: dict[str, Any]) -> dict[str, Any]:
             name = _step_function(step)
             if name:
                 stack.append(name)
+                if '__vulgate_action_' in name:
+                    blocked = True
             continue
         if kind == 'function-return':
             if stack:
@@ -723,6 +894,881 @@ def render_vm_equivalence_check(policy_src: str,
     }
 
 
+_DSL_READ_WIDTHS = {
+    'vg_read_u8': (1, 'uint8_t'),
+    'vg_read_s8': (1, 'uint8_t'),
+    'vg_read_u16': (2, 'uint16_t'),
+    'vg_read_s16': (2, 'uint16_t'),
+    'vg_read_u32': (4, 'uint32_t'),
+    'vg_read_s32': (4, 'uint32_t'),
+    'vg_read_u64': (8, 'uint64_t'),
+    'vg_read_s64': (8, 'uint64_t'),
+    'vg_read_pointer': (8, 'uintptr_t'),
+}
+
+
+class _DslAstCGenerator:
+    def __init__(self,
+                 *,
+                 mode: str,
+                 selectors: dict[str, Any] | None = None,
+                 map_ids: dict[str, int] | None = None,
+                 dsl_globals: dict[str, int] | None = None,
+                 local_slots: dict[str, int] | None = None,
+                 param_names: list[str] | None = None,
+                 obs_arg_indices: list[int] | None = None,
+                 obs_local_names: list[str] | None = None,
+                 alloc_site: Any = None):
+        self.mode = mode
+        self.selectors = selectors or {}
+        self.map_ids = map_ids or {}
+        self.dsl_globals = dsl_globals or {}
+        self.local_slots = local_slots or {}
+        self.param_names = param_names or []
+        self.obs_arg_indices = obs_arg_indices or []
+        self.obs_local_names = obs_local_names or []
+        self.alloc_site = alloc_site
+        self.lines: list[str] = []
+        self._counter = 0
+
+    def _tmp(self, prefix: str = 'v') -> str:
+        name = f'__vg_d_{prefix}_{self._counter}'
+        self._counter += 1
+        return name
+
+    def emit_loops(self, loops: list[dict[str, Any]]) -> None:
+        for loop in loops:
+            var_name = str(loop['var'])
+            start = int(loop['start'])
+            bound = int(loop['bound'])
+            count = bound - start
+            if count < 0:
+                count = 0
+            if self.mode == 'vm_ref':
+                self.lines.append(f'if (!__vg_abort) {{ ctx->regs[14] = (uint64_t)(int64_t)(int32_t)({start}); }}')
+                for _it in range(count):
+                    for op in loop.get('ops') or []:
+                        if op.get('kind') == 'set':
+                            self.emit_map_set(str(op['map']), op['key'], op['value'])
+                    self.lines.append('if (!__vg_abort) { ctx->regs[14] = ctx->regs[14] + 1ULL; }')
+            else:
+                c_idx = self._tmp('lcnt')
+                lv = f'__vg_lv_{re.sub(r"[^A-Za-z0-9_]", "_", var_name)}'
+                self.lines.append(f'uint64_t {lv} = UINT64_C({start & ((1 << 64) - 1)});')
+                self.lines.append(f'for (int {c_idx} = 0; {c_idx} < {count} && !__vg_abort; ++{c_idx}) {{')
+                for op in loop.get('ops') or []:
+                    if op.get('kind') == 'set':
+                        self.emit_map_set(str(op['map']), op['key'], op['value'])
+                self.lines.append(f'if (!__vg_abort) {{ {lv} = {lv} + 1ULL; }}')
+                self.lines.append('}')
+
+    def emit_map_set(self, map_name: str, key_node: dict[str, Any], val_node: dict[str, Any]) -> None:
+        kv = self.emit_value(key_node)
+        vv = self._tmp('msetv')
+        self.lines.append(f'uint64_t {vv} = 0ULL;')
+        self.lines.append('if (!__vg_abort) {')
+        sub_v = self.emit_value(val_node)
+        self.lines.append(f'{vv} = {sub_v};')
+        if self.mode == 'vm_ref':
+            mid = int(self.map_ids[map_name])
+            self.lines.append(
+                f'if (!__vg_abort && ctx->maps && {mid}U < ctx->map_count) {{ '
+                f'(void)shadow_map_set(&ctx->maps[{mid}U], {kv}, {vv}); }}'
+            )
+        else:
+            self.lines.append(f'if (!__vg_abort) {{ (void)__vulgate_table_set_{map_name}(0ULL, {kv}, {vv}); }}')
+        self.lines.append('}')
+
+    def emit_operations(self, ops: list[dict[str, Any]]) -> None:
+        for entry in ops:
+            if entry.get('kind') == 'loop':
+                self.emit_loops([entry])
+            elif entry.get('kind') == 'set':
+                self.emit_map_set(str(entry['map']), entry['key'], entry['value'])
+
+    def emit_value(self, node: dict[str, Any]) -> str:
+        kind = str(node['kind'])
+        out = self._tmp('val')
+        self.lines.append(f'uint64_t {out} = 0ULL;')
+        self.lines.append('if (!__vg_abort) {')
+        if kind == 'const':
+            v = int(node['value']) & ((1 << 64) - 1)
+            self.lines.append(f'{out} = UINT64_C({v});')
+        elif kind == 'arg':
+            idx = int(node['index'])
+            if self.mode == 'vm_ref':
+                if 0 <= idx < 6:
+                    self.lines.append(f'{out} = ctx->args[{idx}];')
+                else:
+                    self.lines.append('__vg_abort = 1;')
+            elif self.mode == 'paired_obs':
+                if idx in self.obs_arg_indices:
+                    pos = self.obs_arg_indices.index(idx)
+                    self.lines.append(f'{out} = __vg_oa_{pos};')
+                else:
+                    self.lines.append(f'{out} = 0ULL;')
+            else:
+                if 0 <= idx < len(self.param_names):
+                    self.lines.append(f'{out} = (uint64_t)(uintptr_t)({self.param_names[idx]});')
+                else:
+                    self.lines.append(f'{out} = 0ULL;')
+        elif kind == 'local':
+            lname = str(node['name'])
+            if self.mode == 'vm_ref':
+                slot = int(self.local_slots.get(lname, 0))
+                if 0 <= slot < 16:
+                    self.lines.append(f'{out} = ctx->regs[{slot}];')
+                else:
+                    self.lines.append('__vg_abort = 1;')
+            elif self.mode == 'paired_obs':
+                if lname in self.obs_local_names:
+                    pos = self.obs_local_names.index(lname)
+                    self.lines.append(f'{out} = __vg_ol_{pos};')
+                else:
+                    self.lines.append(f'{out} = 0ULL;')
+            else:
+                self.lines.append(f'{out} = 0ULL;')
+        elif kind == 'var':
+            vname = str(node['name'])
+            if self.mode == 'vm_ref':
+                self.lines.append(f'{out} = ctx->regs[14];')
+            else:
+                lv = f'__vg_lv_{re.sub(r"[^A-Za-z0-9_]", "_", vname)}'
+                self.lines.append(f'{out} = {lv};')
+        elif kind == 'global':
+            gname = str(node['name'])
+            if self.mode == 'vm_ref':
+                gaddr = int(self.dsl_globals[gname]) & ((1 << 64) - 1)
+                self.lines.append(f'{out} = UINT64_C({gaddr});')
+            else:
+                self.lines.append(f'{out} = (uint64_t)(uintptr_t)(const void *)&{gname};')
+        elif kind == 'sel':
+            sname = str(node['name'])
+            sub = self.emit_value(self.selectors[sname])
+            self.lines.append(f'{out} = {sub};')
+        elif kind == 'read':
+            helper = str(node['helper'])
+            width, ctype = _DSL_READ_WIDTHS[helper]
+            addr_v = self.emit_value(node['address'])
+            self.lines.append('if (!__vg_abort) {')
+            if self.mode == 'vm_ref':
+                rtmp = self._tmp('rd')
+                site = int(self.alloc_site())
+                self.lines.append(f'uint64_t {rtmp} = 0;')
+                self.lines.append(
+                    f'if (__vg_mem_load(&{rtmp}, (uint64_t)({addr_v}), {width}, {site}U) != 0) {{ '
+                    f'__vg_abort = 1; }} else {{ {out} = {rtmp}; }}'
+                )
+            else:
+                self.lines.append(
+                    f'if ((const void *)(uintptr_t)({addr_v}) == NULL || '
+                    f'!__CPROVER_r_ok((const void *)(uintptr_t)({addr_v}), sizeof({ctype}))) {{ '
+                    f'__vg_abort = 1; }} else {{ '
+                    f'{out} = (uint64_t)(*(const {ctype} *)(const void *)(uintptr_t)({addr_v})); }}'
+                )
+            self.lines.append('}')
+        elif kind == 'mapget':
+            mname = str(node['map'])
+            consume = 1 if node.get('consume') else 0
+            kv = self.emit_value(node['key'])
+            self.lines.append('if (!__vg_abort) {')
+            if self.mode == 'vm_ref':
+                mid = int(self.map_ids[mname])
+                mv = self._tmp('mg')
+                self.lines.append(f'shadow_u64 {mv} = 0;')
+                self.lines.append(
+                    f'if (ctx->maps && {mid}U < ctx->map_count && shadow_map_get(&ctx->maps[{mid}U], {kv}, &{mv}) == 0) {{ '
+                    f'if ({consume}) shadow_map_delete(&ctx->maps[{mid}U], {kv}); '
+                    f'{out} = (uint64_t){mv}; }}'
+                )
+            else:
+                mv = self._tmp('mg')
+                self.lines.append(f'uint64_t {mv} = 0ULL;')
+                self.lines.append(f'(void)__vulgate_table_get_{mname}(0ULL, {kv}, &{mv}, {consume});')
+                self.lines.append(f'{out} = {mv};')
+            self.lines.append('}')
+        elif kind == 'mappresent':
+            mname = str(node['map'])
+            kv = self.emit_value(node['key'])
+            self.lines.append('if (!__vg_abort) {')
+            if self.mode == 'vm_ref':
+                mid = int(self.map_ids[mname])
+                self.lines.append(
+                    f'if (ctx->maps && {mid}U < ctx->map_count) {{ '
+                    f'{out} = (uint64_t)shadow_map_present(&ctx->maps[{mid}U], {kv}); }}'
+                )
+            else:
+                mv = self._tmp('mp')
+                self.lines.append(f'uint64_t {mv} = 0ULL;')
+                self.lines.append(f'{out} = (uint64_t)__vulgate_table_get_{mname}(0ULL, {kv}, &{mv}, 0);')
+            self.lines.append('}')
+        elif kind == 'unary':
+            op = str(node['op'])
+            if op == '!':
+                cv = self.emit_condition(node['operand'])
+                self.lines.append(f'if (!__vg_abort) {{ {out} = {cv} ? 0ULL : 1ULL; }}')
+            elif op == '-':
+                vv = self.emit_value(node['operand'])
+                self.lines.append(f'if (!__vg_abort) {{ {out} = 0ULL - {vv}; }}')
+            elif op == '~':
+                vv = self.emit_value(node['operand'])
+                self.lines.append(f'if (!__vg_abort) {{ {out} = {vv} ^ UINT64_MAX; }}')
+            else:
+                raise ValueError(f'unsupported unary operator: {op}')
+        elif kind == 'bin':
+            op = str(node['op'])
+            if op in ('==', '!=', '<', '<=', '>', '>='):
+                cv = self.emit_condition(node)
+                self.lines.append(f'if (!__vg_abort) {{ {out} = {cv} ? 1ULL : 0ULL; }}')
+            else:
+                lv = self.emit_value(node['left'])
+                self.lines.append('if (!__vg_abort) {')
+                rv = self.emit_value(node['right'])
+                if op in ('<<', '>>'):
+                    self.lines.append(f'if (!__vg_abort) {{ {out} = {lv} {op} ({rv} & 63ULL); }}')
+                else:
+                    self.lines.append(f'if (!__vg_abort) {{ {out} = {lv} {op} {rv}; }}')
+                self.lines.append('}')
+        else:
+            raise ValueError(f'unsupported DSL AST value kind: {kind}')
+        self.lines.append('}')
+        return out
+
+    def emit_condition(self, node: dict[str, Any]) -> str:
+        kind = str(node['kind'])
+        out = self._tmp('cond')
+        self.lines.append(f'int {out} = 0;')
+        self.lines.append('if (!__vg_abort) {')
+        if kind == 'const':
+            self.lines.append(f'{out} = {1 if int(node["value"]) else 0};')
+        elif kind == 'unary' and str(node['op']) == '!':
+            sub = self.emit_condition(node['operand'])
+            self.lines.append(f'if (!__vg_abort) {{ {out} = !{sub}; }}')
+        elif kind == 'bin' and str(node['op']) == '&&':
+            lc = self.emit_condition(node['left'])
+            self.lines.append(f'if (!__vg_abort && {lc}) {{')
+            rc = self.emit_condition(node['right'])
+            self.lines.append(f'if (!__vg_abort) {{ {out} = {rc}; }}')
+            self.lines.append('}')
+        elif kind == 'bin' and str(node['op']) == '||':
+            lc = self.emit_condition(node['left'])
+            self.lines.append(f'if (!__vg_abort) {{ if ({lc}) {{ {out} = 1; }} else {{')
+            rc = self.emit_condition(node['right'])
+            self.lines.append(f'if (!__vg_abort) {{ {out} = {rc}; }}')
+            self.lines.append('} }')
+        elif kind == 'bin' and str(node['op']) in ('==', '!=', '<', '<=', '>', '>='):
+            op = str(node['op'])
+            lv = self.emit_value(node['left'])
+            self.lines.append('if (!__vg_abort) {')
+            rv = self.emit_value(node['right'])
+            self.lines.append(f'if (!__vg_abort) {{ {out} = ({lv} {op} {rv}) ? 1 : 0; }}')
+            self.lines.append('}')
+        else:
+            vv = self.emit_value(node)
+            self.lines.append(f'if (!__vg_abort) {{ {out} = ({vv} != 0ULL) ? 1 : 0; }}')
+        self.lines.append('}')
+        return out
+
+
+_PC_JUMP_CODES = {
+    0x05, 0x15, 0x1D, 0x25, 0x2D, 0x35, 0x3D, 0x55, 0x5D,
+    0x65, 0x6D, 0x75, 0x7D, 0xA5, 0xAD, 0xB5, 0xBD, 0xC5, 0xCD, 0xD5, 0xDD,
+}
+
+
+def _pc_dst(regs: int) -> int:
+    return regs & 0x0F
+
+
+def _pc_src(regs: int) -> int:
+    return (regs >> 4) & 0x0F
+
+
+def _validated_countdown_loop(rows: list[tuple[int, int, int, int]], pc: int) -> tuple[int, int] | None:
+    code, regs, off, imm = rows[pc]
+    if code != 0x25 or imm != 0 or _pc_src(regs) != 0 or off >= 0:
+        return None
+    reg_c = _pc_dst(regs)
+    header = pc + 1 + off
+    if reg_c == 0 or reg_c > 10 or header < 1 or pc < header + 1:
+        return None
+    init_code, init_regs, _, init_imm = rows[header - 1]
+    dec_code, dec_regs, _, dec_imm = rows[pc - 1]
+    if init_code != 0xB7 or _pc_dst(init_regs) != reg_c or init_imm < 1 or init_imm > 1024:
+        return None
+    if dec_code != 0x17 or _pc_dst(dec_regs) != reg_c or dec_imm != 1:
+        return None
+    return header, int(init_imm)
+
+
+def _emit_unrolled_safe_read(mem_cap: int) -> str:
+    if mem_cap <= 0:
+        slots = 'int __vg_mem_load(uint64_t *dst, uint64_t base, size_t n, unsigned site) { (void)dst; (void)base; (void)n; (void)site; return -1; }\n'
+    else:
+        lookup = ' '.join(
+            f'if (site != {k}U && __vg_rd_written[{k}] && __vg_rd_addr[{k}] == base && __vg_rd_len[{k}] == (uint8_t)n) {{'
+            f' if (__vg_rd_fault[{k}]) return -1; *dst = __vg_rd_val[{k}]; return 0; }}'
+            for k in range(mem_cap)
+        )
+        store = ' '.join(
+            f'if (site == {k}U) {{ __vg_rd_addr[{k}] = base; __vg_rd_len[{k}] = (uint8_t)n; __vg_rd_val[{k}] = wv; __vg_rd_fault[{k}] = fv; __vg_rd_written[{k}] = 1; }} else '
+            for k in range(mem_cap)
+        ) + '{ return -1; }'
+        slots = ''.join([
+            'extern uint8_t nondet_vg_u8(void);\n',
+            f'static uint64_t __vg_rd_addr[{mem_cap}];\n',
+            f'static uint8_t __vg_rd_len[{mem_cap}];\n',
+            f'static uint64_t __vg_rd_val[{mem_cap}];\n',
+            f'static uint8_t __vg_rd_fault[{mem_cap}];\n',
+            f'static uint8_t __vg_rd_written[{mem_cap}];\n',
+            'int __vg_mem_load(uint64_t *dst, uint64_t base, size_t n, unsigned site) {\n',
+            '    uint64_t mask;\n',
+            '    uint8_t fv;\n',
+            '    uint64_t wv;\n',
+            '    if (!dst || n == 0 || n > 8) return -1;\n    ',
+            lookup,
+            '\n',
+            '    fv = nondet_vg_u8() & 1U;\n',
+            '    wv = nondet_vg_u64();\n',
+            '    mask = n == 1U ? 0xFFULL : n == 2U ? 0xFFFFULL : n == 4U ? 0xFFFFFFFFULL : 0xFFFFFFFFFFFFFFFFULL;\n',
+            '    wv &= mask;\n    ',
+            store,
+            '\n',
+            '    if (fv) return -1;\n',
+            '    *dst = wv;\n',
+            '    return 0;\n',
+            '}\n',
+        ])
+    return slots + f'''int shadow_map_get(const shadow_map *map, shadow_u64 key, shadow_u64 *value) {{
+    if (!map || !map->entries || !value) return -1;
+    if (map->capacity > 0U && map->entries[0].used && map->entries[0].key == key) {{ *value = map->entries[0].value; return 0; }}
+    if (map->capacity > 1U && map->entries[1].used && map->entries[1].key == key) {{ *value = map->entries[1].value; return 0; }}
+    if (map->capacity > 2U && map->entries[2].used && map->entries[2].key == key) {{ *value = map->entries[2].value; return 0; }}
+    if (map->capacity > 3U && map->entries[3].used && map->entries[3].key == key) {{ *value = map->entries[3].value; return 0; }}
+    if (map->capacity > 4U && map->entries[4].used && map->entries[4].key == key) {{ *value = map->entries[4].value; return 0; }}
+    if (map->capacity > 5U && map->entries[5].used && map->entries[5].key == key) {{ *value = map->entries[5].value; return 0; }}
+    if (map->capacity > 6U && map->entries[6].used && map->entries[6].key == key) {{ *value = map->entries[6].value; return 0; }}
+    if (map->capacity > 7U && map->entries[7].used && map->entries[7].key == key) {{ *value = map->entries[7].value; return 0; }}
+    return -1;
+}}
+int shadow_map_set(shadow_map *map, shadow_u64 key, shadow_u64 value) {{
+    if (!map || !map->entries) return -1;
+    if (map->capacity > 0U && map->entries[0].used && map->entries[0].key == key) {{ map->entries[0].value = value; return 0; }}
+    if (map->capacity > 1U && map->entries[1].used && map->entries[1].key == key) {{ map->entries[1].value = value; return 0; }}
+    if (map->capacity > 2U && map->entries[2].used && map->entries[2].key == key) {{ map->entries[2].value = value; return 0; }}
+    if (map->capacity > 3U && map->entries[3].used && map->entries[3].key == key) {{ map->entries[3].value = value; return 0; }}
+    if (map->capacity > 4U && map->entries[4].used && map->entries[4].key == key) {{ map->entries[4].value = value; return 0; }}
+    if (map->capacity > 5U && map->entries[5].used && map->entries[5].key == key) {{ map->entries[5].value = value; return 0; }}
+    if (map->capacity > 6U && map->entries[6].used && map->entries[6].key == key) {{ map->entries[6].value = value; return 0; }}
+    if (map->capacity > 7U && map->entries[7].used && map->entries[7].key == key) {{ map->entries[7].value = value; return 0; }}
+    if (map->capacity > 0U && !map->entries[0].used) {{ map->entries[0].used = 1; map->entries[0].key = key; map->entries[0].value = value; map->count++; return 0; }}
+    if (map->capacity > 1U && !map->entries[1].used) {{ map->entries[1].used = 1; map->entries[1].key = key; map->entries[1].value = value; map->count++; return 0; }}
+    if (map->capacity > 2U && !map->entries[2].used) {{ map->entries[2].used = 1; map->entries[2].key = key; map->entries[2].value = value; map->count++; return 0; }}
+    if (map->capacity > 3U && !map->entries[3].used) {{ map->entries[3].used = 1; map->entries[3].key = key; map->entries[3].value = value; map->count++; return 0; }}
+    if (map->capacity > 4U && !map->entries[4].used) {{ map->entries[4].used = 1; map->entries[4].key = key; map->entries[4].value = value; map->count++; return 0; }}
+    if (map->capacity > 5U && !map->entries[5].used) {{ map->entries[5].used = 1; map->entries[5].key = key; map->entries[5].value = value; map->count++; return 0; }}
+    if (map->capacity > 6U && !map->entries[6].used) {{ map->entries[6].used = 1; map->entries[6].key = key; map->entries[6].value = value; map->count++; return 0; }}
+    if (map->capacity > 7U && !map->entries[7].used) {{ map->entries[7].used = 1; map->entries[7].key = key; map->entries[7].value = value; map->count++; return 0; }}
+    return -2;
+}}
+int shadow_map_present(const shadow_map *map, shadow_u64 key) {{
+    shadow_u64 value = 0;
+    return shadow_map_get(map, key, &value) == 0 ? 1 : 0;
+}}
+int shadow_map_delete(shadow_map *map, shadow_u64 key) {{
+    if (!map || !map->entries) return -1;
+    if (map->capacity > 0U && map->entries[0].used && map->entries[0].key == key) {{ map->entries[0].used = 0; map->entries[0].value = 0; if (map->count > 0) map->count--; return 0; }}
+    if (map->capacity > 1U && map->entries[1].used && map->entries[1].key == key) {{ map->entries[1].used = 0; map->entries[1].value = 0; if (map->count > 0) map->count--; return 0; }}
+    if (map->capacity > 2U && map->entries[2].used && map->entries[2].key == key) {{ map->entries[2].used = 0; map->entries[2].value = 0; if (map->count > 0) map->count--; return 0; }}
+    if (map->capacity > 3U && map->entries[3].used && map->entries[3].key == key) {{ map->entries[3].used = 0; map->entries[3].value = 0; if (map->count > 0) map->count--; return 0; }}
+    if (map->capacity > 4U && map->entries[4].used && map->entries[4].key == key) {{ map->entries[4].used = 0; map->entries[4].value = 0; if (map->count > 0) map->count--; return 0; }}
+    if (map->capacity > 5U && map->entries[5].used && map->entries[5].key == key) {{ map->entries[5].used = 0; map->entries[5].value = 0; if (map->count > 0) map->count--; return 0; }}
+    if (map->capacity > 6U && map->entries[6].used && map->entries[6].key == key) {{ map->entries[6].used = 0; map->entries[6].value = 0; if (map->count > 0) map->count--; return 0; }}
+    if (map->capacity > 7U && map->entries[7].used && map->entries[7].key == key) {{ map->entries[7].used = 0; map->entries[7].value = 0; if (map->count > 0) map->count--; return 0; }}
+    return -1;
+}}
+static int run_helper(shadow_u64 helper_id, shadow_u64 regs[11], shadow_u64 scratch[SHADOW_MAX_SCRATCH], const shadow_ctx *ctx, shadow_stats *stats) {{
+    if (stats) stats->helper_calls++;
+    switch (helper_id) {{
+    case SHADOW_HELPER_GET_ARG:
+        if (regs[1] >= SHADOW_MAX_ARGS) {{ regs[0] = (shadow_u64)-1; return -1; }}
+        regs[0] = ctx->args[regs[1]];
+        return 0;
+    case SHADOW_HELPER_GET_REG:
+        if (regs[1] >= SHADOW_MAX_REGS) {{ regs[0] = (shadow_u64)-1; return -1; }}
+        regs[0] = ctx->regs[regs[1]];
+        return 0;
+    case SHADOW_HELPER_SET_REG:
+        if (regs[1] >= SHADOW_MAX_REGS) {{ regs[0] = (shadow_u64)-1; return -1; }}
+        ((shadow_ctx *)ctx)->regs[regs[1]] = regs[2];
+        regs[0] = 0;
+        return 0;
+    case SHADOW_HELPER_SCRATCH_LOAD:
+        if (regs[1] >= SHADOW_MAX_SCRATCH) {{ regs[0] = (shadow_u64)-1; return -1; }}
+        regs[0] = scratch[regs[1]];
+        return 0;
+    case SHADOW_HELPER_SCRATCH_STORE:
+        if (regs[1] >= SHADOW_MAX_SCRATCH) {{ regs[0] = (shadow_u64)-1; return -1; }}
+        scratch[regs[1]] = regs[2];
+        regs[0] = 0;
+        return 0;
+    case SHADOW_HELPER_MAP_SET:
+        if (!ctx->maps || regs[1] >= ctx->map_count) {{ regs[0] = (shadow_u64)-1; return 0; }}
+        regs[0] = (shadow_u64)shadow_map_set(&ctx->maps[regs[1]], regs[2], regs[3]);
+        return 0;
+    case SHADOW_HELPER_MAP_GET: {{
+        shadow_u64 value = 0;
+        if (!ctx->maps || regs[1] >= ctx->map_count || shadow_map_get(&ctx->maps[regs[1]], regs[2], &value) != 0) {{
+            regs[0] = 0;
+            return 0;
+        }}
+        if (regs[3] != 0) shadow_map_delete(&ctx->maps[regs[1]], regs[2]);
+        regs[0] = value;
+        return 0;
+    }}
+    case SHADOW_HELPER_MAP_PRESENT:
+        if (!ctx->maps || regs[1] >= ctx->map_count) {{ regs[0] = 0; return 0; }}
+        regs[0] = (shadow_u64)shadow_map_present(&ctx->maps[regs[1]], regs[2]);
+        return 0;
+    case SHADOW_HELPER_MAP_DELETE:
+        if (!ctx->maps || regs[1] >= ctx->map_count) {{ regs[0] = (shadow_u64)-1; return 0; }}
+        regs[0] = (shadow_u64)shadow_map_delete(&ctx->maps[regs[1]], regs[2]);
+        return 0;
+    default:
+        regs[0] = SHADOW_VM_ERROR;
+        return -1;
+    }}
+}}
+'''
+
+def _pc_jump_test(code: int, dst: int, src: int, imm: int) -> str | None:
+    if code == 0x05:
+        return None
+    lhs = f'regs[{dst}]'
+    rhs = f'regs[{src}]' if (code & 0x08) else f'(shadow_u64)(shadow_s64)({imm})'
+    op = {
+        0x15: '==', 0x1D: '==',
+        0x25: '>', 0x2D: '>',
+        0x35: '>=', 0x3D: '>=',
+        0x55: '!=', 0x5D: '!=',
+        0x65: '>', 0x6D: '>',
+        0x75: '>=', 0x7D: '>=',
+        0xA5: '<', 0xAD: '<',
+        0xB5: '<=', 0xBD: '<=',
+        0xC5: '<', 0xCD: '<',
+        0xD5: '<=', 0xDD: '<=',
+    }[code]
+    if code in (0x65, 0x6D, 0x75, 0x7D, 0xC5, 0xCD, 0xD5, 0xDD):
+        return f'((shadow_s64){lhs} {op} (shadow_s64){rhs})'
+    return f'({lhs} {op} {rhs})'
+
+
+def _emit_pc_specialized_interpreter(rows: list[tuple[int, int, int, int]], alloc_site: Any) -> str:
+    loops: dict[int, tuple[int, int]] = {}
+    for pc in range(len(rows)):
+        found = _validated_countdown_loop(rows, pc)
+        if found is not None:
+            header, bound = found
+            loops[header] = (pc, bound)
+    alu = {
+        0x04: lambda d, s, imm: f'regs[{d}] = (shadow_u32)regs[{d}] + (shadow_u32)({imm});',
+        0x0C: lambda d, s, imm: f'regs[{d}] = (shadow_u32)regs[{d}] + (shadow_u32)regs[{s}];',
+        0x07: lambda d, s, imm: f'regs[{d}] += (shadow_u64)(shadow_s64)({imm});',
+        0x0F: lambda d, s, imm: f'regs[{d}] += regs[{s}];',
+        0x14: lambda d, s, imm: f'regs[{d}] = (shadow_u32)regs[{d}] - (shadow_u32)({imm});',
+        0x1C: lambda d, s, imm: f'regs[{d}] = (shadow_u32)regs[{d}] - (shadow_u32)regs[{s}];',
+        0x17: lambda d, s, imm: f'regs[{d}] -= (shadow_u64)(shadow_s64)({imm});',
+        0x1F: lambda d, s, imm: f'regs[{d}] -= regs[{s}];',
+        0x24: lambda d, s, imm: f'regs[{d}] = (shadow_u32)regs[{d}] * (shadow_u32)({imm});',
+        0x2C: lambda d, s, imm: f'regs[{d}] = (shadow_u32)regs[{d}] * (shadow_u32)regs[{s}];',
+        0x27: lambda d, s, imm: f'regs[{d}] *= (shadow_u64)(shadow_s64)({imm});',
+        0x2F: lambda d, s, imm: f'regs[{d}] *= regs[{s}];',
+        0x54: lambda d, s, imm: f'regs[{d}] = (shadow_u32)regs[{d}] & (shadow_u32)({imm});',
+        0x5C: lambda d, s, imm: f'regs[{d}] = (shadow_u32)regs[{d}] & (shadow_u32)regs[{s}];',
+        0x57: lambda d, s, imm: f'regs[{d}] &= (shadow_u64)(shadow_s64)({imm});',
+        0x5F: lambda d, s, imm: f'regs[{d}] &= regs[{s}];',
+        0x44: lambda d, s, imm: f'regs[{d}] = (shadow_u32)regs[{d}] | (shadow_u32)({imm});',
+        0x4C: lambda d, s, imm: f'regs[{d}] = (shadow_u32)regs[{d}] | (shadow_u32)regs[{s}];',
+        0x47: lambda d, s, imm: f'regs[{d}] |= (shadow_u64)(shadow_s64)({imm});',
+        0x4F: lambda d, s, imm: f'regs[{d}] |= regs[{s}];',
+        0xA4: lambda d, s, imm: f'regs[{d}] = (shadow_u32)regs[{d}] ^ (shadow_u32)({imm});',
+        0xAC: lambda d, s, imm: f'regs[{d}] = (shadow_u32)regs[{d}] ^ (shadow_u32)regs[{s}];',
+        0xA7: lambda d, s, imm: f'regs[{d}] ^= (shadow_u64)(shadow_s64)({imm});',
+        0xAF: lambda d, s, imm: f'regs[{d}] ^= regs[{s}];',
+        0x64: lambda d, s, imm: f'regs[{d}] = (shadow_u32)regs[{d}] << ((shadow_u32)({imm}) & 31U);',
+        0x6C: lambda d, s, imm: f'regs[{d}] = (shadow_u32)regs[{d}] << ((shadow_u32)regs[{s}] & 31U);',
+        0x67: lambda d, s, imm: f'regs[{d}] <<= ((shadow_u64)(shadow_s64)({imm}) & 63ULL);',
+        0x6F: lambda d, s, imm: f'regs[{d}] <<= (regs[{s}] & 63ULL);',
+        0x74: lambda d, s, imm: f'regs[{d}] = (shadow_u32)regs[{d}] >> ((shadow_u32)({imm}) & 31U);',
+        0x7C: lambda d, s, imm: f'regs[{d}] = (shadow_u32)regs[{d}] >> ((shadow_u32)regs[{s}] & 31U);',
+        0x77: lambda d, s, imm: f'regs[{d}] >>= ((shadow_u64)(shadow_s64)({imm}) & 63ULL);',
+        0x7F: lambda d, s, imm: f'regs[{d}] >>= (regs[{s}] & 63ULL);',
+        0xB4: lambda d, s, imm: f'regs[{d}] = (shadow_u32)({imm});',
+        0xBC: lambda d, s, imm: f'regs[{d}] = (shadow_u32)regs[{s}];',
+        0xB7: lambda d, s, imm: f'regs[{d}] = (shadow_u64)(shadow_s64)({imm});',
+        0xBF: lambda d, s, imm: f'regs[{d}] = regs[{s}];',
+    }
+    lines: list[str] = []
+    program_len = len(rows)
+
+    def resolve(pc: int, scopes: list[tuple[int, int, str]]) -> str:
+        if pc == program_len:
+            return 'pc_end'
+        if pc < 0 or pc > program_len:
+            return 'pc_end'
+        for lo, hi, suf in reversed(scopes):
+            if lo <= pc < hi:
+                return f'pc_{pc}{suf}'
+        return f'pc_{pc}'
+
+    def emit_insn(pc: int, scopes: list[tuple[int, int, str]]) -> None:
+        code, regs, off, imm = rows[pc]
+        dst = _pc_dst(regs)
+        src = _pc_src(regs)
+        lines.append(f'{resolve(pc, scopes)}:')
+        lines.append('steps++;')
+        lines.append('if (stats) stats->instructions = steps;')
+        lines.append('if (steps > step_limit) return SHADOW_UNKNOWN;')
+        if code in alu:
+            lines.append(alu[code](dst, src, imm))
+            return
+        if code in _PC_JUMP_CODES:
+            target = pc + 1 + off
+            taken = 'return SHADOW_VM_ERROR;' if target < 0 or target > program_len else f'goto {resolve(target, scopes)};'
+            fall = f'goto {resolve(pc + 1, scopes)};'
+            test = _pc_jump_test(code, dst, src, imm)
+            if test is None:
+                lines.append(taken)
+            else:
+                lines.append(f'if {test} {{ {taken} }} else {{ {fall} }}')
+            return
+        if code == 0x85:
+            if imm in (2, 4, 5, 6):
+                width = {2: 1, 4: 2, 5: 4, 6: 8}[imm]
+                site = int(alloc_site())
+                lines.append('if (stats) stats->helper_calls++;')
+                lines.append('if (stats) stats->safe_reads++;')
+                lines.append('{')
+                lines.append('shadow_u64 __vg_loaded = 0;')
+                lines.append(
+                    f'if (__vg_mem_load(&__vg_loaded, regs[1], {width}, {site}U) != 0) {{ '
+                    f'regs[0] = (shadow_u64)-1; return SHADOW_UNKNOWN; }}'
+                )
+                lines.append('regs[0] = __vg_loaded;')
+                lines.append('}')
+            else:
+                lines.append(
+                    f'if (run_helper((shadow_u64)({imm}), regs, scratch, ctx, stats) != 0) return SHADOW_UNKNOWN;'
+                )
+            lines.append(f'goto {resolve(pc + 1, scopes)};')
+            return
+        if code == 0x95:
+            lines.append(
+                'if (regs[0] == SHADOW_PASS || regs[0] == SHADOW_BLOCK || regs[0] == SHADOW_UNKNOWN) '
+                'return (shadow_decision)regs[0];'
+            )
+            lines.append('return SHADOW_VM_ERROR;')
+            return
+        lines.append('return SHADOW_VM_ERROR;')
+
+    def emit_span(start: int, end: int, scopes: list[tuple[int, int, str]]) -> None:
+        parent_suf = scopes[-1][2] if scopes else ''
+        pc = start
+        while pc < end:
+            if pc in loops and loops[pc][0] < end:
+                latch, bound = loops[pc]
+                for it in range(bound):
+                    suf = parent_suf if it == 0 else f'{parent_suf}_u{pc}_{it}'
+                    emit_span(pc, latch, scopes + [(pc, latch, suf)])
+                pc = latch + 1
+                continue
+            emit_insn(pc, scopes)
+            pc += 1
+
+    emit_span(0, program_len, [(0, program_len, '')])
+    lines.append('pc_end:')
+    lines.append('return SHADOW_VM_ERROR;')
+    body = '\n'.join(f'    {line}' for line in lines)
+    return (
+        'static shadow_decision __vg_pc_exec(shadow_ctx *ctx, shadow_stats *stats, shadow_u64 step_limit) {\n'
+        '    shadow_u64 regs[11] = {0};\n'
+        '    shadow_u64 scratch[SHADOW_MAX_SCRATCH] = {0};\n'
+        '    shadow_u64 steps = 0;\n'
+        '    if (!ctx) return SHADOW_VM_ERROR;\n'
+        '    if (stats) memset(stats, 0, sizeof(*stats));\n'
+        '    regs[1] = (shadow_u64)(uintptr_t)ctx;\n'
+        '    goto pc_0;\n'
+        f'{body}\n'
+        '}\n'
+    )
+
+
+def _count_ast_reads(item: Any, selectors: dict[str, Any] | None = None) -> int:
+    if isinstance(item, list):
+        return sum(_count_ast_reads(x, selectors) for x in item)
+    if not isinstance(item, dict):
+        return 0
+    kind = item.get('kind')
+    if kind == 'read':
+        return 1 + _count_ast_reads(item.get('address'), selectors)
+    if kind == 'sel' and selectors and item.get('name') in selectors:
+        return _count_ast_reads(selectors[item['name']], selectors)
+    return sum(_count_ast_reads(v, selectors) for v in item.values() if isinstance(v, (dict, list)))
+
+
+def _verify_dsl_vm_mount_equivalence(mount_ir: dict[str, Any],
+                                     *,
+                                     is_observer: bool,
+                                     cbmc_bin: Path,
+                                     output_dir: Path,
+                                     timeout: int = 90) -> dict[str, Any]:
+    output_dir = Path(output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    raw = Path(mount_ir['dsl_vm_rule_path']).read_bytes()
+    rows = list(struct.iter_unpack('<BBhi', raw))
+    insn_rows = ',\n'.join('{%d,%d,%d,%d}' % r for r in rows)
+    has_backedge = any(((op & 0x07) in (0x05, 0x06)) and op not in (0x85, 0x95) and off < 0 for op, _, off, _ in rows)
+    vm_maps = list(mount_ir.get('dsl_vm_maps') or [])
+    map_ids = {str(m.get('id') or m.get('name')): idx for idx, m in enumerate(vm_maps)}
+    dsl_globals = {str(k): int(v) for k, v in (mount_ir.get('dsl_vm_globals') or {}).items()}
+    local_slots = {str(item['name']): int(item['slot']) for item in (mount_ir.get('dsl_vm_locals') or [])}
+    read_sites = {'n': 0}
+
+    def alloc_site() -> int:
+        site = read_sites['n']
+        read_sites['n'] = site + 1
+        return site
+
+    if is_observer:
+        ops = list(mount_ir.get('dsl_operations') or [])
+        gen = _DslAstCGenerator(
+            mode='vm_ref',
+            map_ids=map_ids,
+            dsl_globals=dsl_globals,
+            local_slots=local_slots,
+            alloc_site=alloc_site,
+        )
+        gen.emit_operations(ops)
+        ref_fn = '\n'.join([
+            'static shadow_decision __vg_dsl_ref_eval(shadow_ctx *ctx) {',
+            '    int __vg_abort = 0;',
+            *['    ' + line for line in gen.lines],
+            '    if (__vg_abort) return SHADOW_UNKNOWN;',
+            '    return SHADOW_PASS;',
+            '}',
+        ])
+        ast_reads = _count_ast_reads(ops)
+    else:
+        dsl_ast = mount_ir['dsl_ast']
+        selectors = dict(dsl_ast.get('selectors') or {})
+        for idx, lname in enumerate(dsl_ast.get('local_order') or []):
+            local_slots.setdefault(str(lname), idx)
+        gen = _DslAstCGenerator(
+            mode='vm_ref',
+            selectors=selectors,
+            map_ids=map_ids,
+            dsl_globals=dsl_globals,
+            local_slots=local_slots,
+            alloc_site=alloc_site,
+        )
+        gen.emit_loops(list(dsl_ast.get('loops') or []))
+        cond_var = gen.emit_condition(dsl_ast['condition'])
+        ref_fn = '\n'.join([
+            'static shadow_decision __vg_dsl_ref_eval(shadow_ctx *ctx) {',
+            '    int __vg_abort = 0;',
+            *['    ' + line for line in gen.lines],
+            '    if (__vg_abort) return SHADOW_UNKNOWN;',
+            f'    return {cond_var} ? SHADOW_BLOCK : SHADOW_PASS;',
+            '}',
+        ])
+        ast_reads = _count_ast_reads(dsl_ast.get('loops'), selectors) + _count_ast_reads(dsl_ast['condition'], selectors)
+
+    pc_exec = _emit_pc_specialized_interpreter(rows, alloc_site)
+    mem_model_c = _emit_unrolled_safe_read(read_sites['n'])
+
+    max_loop_iters = 2
+    for idx, (op, _, off, _) in enumerate(rows):
+        if ((op & 0x07) in (0x05, 0x06)) and op not in (0x85, 0x95) and off < 0:
+            target = idx + 1 + off
+            bound_imm = rows[target - 1][3] if target >= 1 else 4
+            max_loop_iters = max(max_loop_iters, min(8, int(bound_imm)))
+
+    map_decls: list[str] = []
+    map_inits: list[str] = []
+    map_asserts: list[str] = []
+    max_map_cap = 0
+    if vm_maps:
+        map_decls.append(f'static shadow_map __vg_maps_vm[{len(vm_maps)}];')
+        map_decls.append(f'static shadow_map __vg_maps_ref[{len(vm_maps)}];')
+        for m_i, m_spec in enumerate(vm_maps):
+            cap = min(max(1, int(m_spec.get('capacity', 2))), max_loop_iters)
+            max_map_cap = max(max_map_cap, cap)
+            map_decls.append(f'static shadow_map_entry __vg_entries_vm_{m_i}[{cap}];')
+            map_decls.append(f'static shadow_map_entry __vg_entries_ref_{m_i}[{cap}];')
+            map_inits.append(f'__vg_maps_vm[{m_i}].capacity = {cap}U; __vg_maps_vm[{m_i}].count = 0U; __vg_maps_vm[{m_i}].entries = __vg_entries_vm_{m_i};')
+            map_inits.append(f'__vg_maps_ref[{m_i}].capacity = {cap}U; __vg_maps_ref[{m_i}].count = 0U; __vg_maps_ref[{m_i}].entries = __vg_entries_ref_{m_i};')
+            for s_i in range(cap):
+                u_var = f'__vg_mu_{m_i}_{s_i}'
+                k_var = f'__vg_mk_{m_i}_{s_i}'
+                v_var = f'__vg_mv_{m_i}_{s_i}'
+                map_inits.append(f'shadow_u32 {u_var} = (shadow_u32)(nondet_vg_u64() & 1ULL);')
+                map_inits.append(f'shadow_u64 {k_var} = nondet_vg_u64();')
+                map_inits.append(f'shadow_u64 {v_var} = nondet_vg_u64();')
+                map_inits.append(f'if (!{u_var}) {v_var} = 0ULL;')
+                for prev_s in range(s_i):
+                    prev_u = f'__vg_mu_{m_i}_{prev_s}'
+                    prev_k = f'__vg_mk_{m_i}_{prev_s}'
+                    map_inits.append(f'__CPROVER_assume(!({u_var} && {prev_u} && {k_var} == {prev_k}));')
+                map_inits.append(
+                    f'__vg_entries_vm_{m_i}[{s_i}].used = {u_var}; '
+                    f'__vg_entries_vm_{m_i}[{s_i}].key = {k_var}; '
+                    f'__vg_entries_vm_{m_i}[{s_i}].value = {v_var};'
+                )
+                map_inits.append(
+                    f'__vg_entries_ref_{m_i}[{s_i}] = __vg_entries_vm_{m_i}[{s_i}];'
+                )
+                map_inits.append(f'__vg_maps_vm[{m_i}].count += {u_var}; __vg_maps_ref[{m_i}].count += {u_var};')
+                map_asserts.append(
+                    f'__CPROVER_assert(__vg_entries_vm_{m_i}[{s_i}].used == __vg_entries_ref_{m_i}[{s_i}].used && '
+                    f'(!__vg_entries_vm_{m_i}[{s_i}].used || '
+                    f'(__vg_entries_vm_{m_i}[{s_i}].key == __vg_entries_ref_{m_i}[{s_i}].key && '
+                    f'__vg_entries_vm_{m_i}[{s_i}].value == __vg_entries_ref_{m_i}[{s_i}].value)), '
+                    f'"vg.dsl_vm.map_state_equivalence");'
+                )
+
+    step_bound_estimate = len(rows) + 4
+    for idx, (op, _, off, _) in enumerate(rows):
+        if ((op & 0x07) in (0x05, 0x06)) and op not in (0x85, 0x95) and off < 0:
+            target = idx + 1 + off
+            bound_imm = rows[target - 1][3] if target >= 1 else 64
+            step_bound_estimate += max(1, bound_imm) * (idx - target + 2)
+    step_limit = max(int(mount_ir.get('step_limit', 4096)), step_bound_estimate + 8)
+    bind_maps_stmt = (
+        f'ctx_vm.maps = __vg_maps_vm; ctx_vm.map_count = {len(vm_maps)}U; '
+        f'ctx_ref.maps = __vg_maps_ref; ctx_ref.map_count = {len(vm_maps)}U;'
+        if vm_maps else ''
+    )
+
+    c_code = f'''#include <string.h>
+#include "autoshield.h"
+extern uint64_t nondet_vg_u64(void);
+{mem_model_c}
+{' '.join(map_decls)}
+static const ebpf_insn dsl_insns[] = {{
+{insn_rows}
+}};
+{ref_fn}
+{pc_exec}
+int main(void) {{
+    shadow_program dsl_prog = {{dsl_insns, {len(rows)}, 0, 0}};
+    (void)dsl_prog;
+    shadow_policy policy = {{{step_limit}ULL, SHADOW_UNKNOWN_BLOCK, 0}};
+    shadow_ctx ctx_vm = {{0}};
+    shadow_ctx ctx_ref = {{0}};
+    {' '.join(f'{{ uint64_t v = nondet_vg_u64(); ctx_vm.args[{i}] = v; ctx_ref.args[{i}] = v; }}' for i in range(6))}
+    {' '.join(f'{{ uint64_t v = nondet_vg_u64(); ctx_vm.regs[{i}] = v; ctx_ref.regs[{i}] = v; }}' for i in range(16))}
+    {' '.join(map_inits)}
+    {bind_maps_stmt}
+    shadow_stats stats = {{0}};
+    shadow_decision dsl_dec = __vg_pc_exec(&ctx_vm, &stats, policy.step_limit);
+    shadow_decision ref_dec = __vg_dsl_ref_eval(&ctx_ref);
+    __CPROVER_assert(dsl_dec != SHADOW_VM_ERROR, "vg.dsl_vm.no_vm_error");
+    __CPROVER_assert(stats.instructions <= policy.step_limit + 1ULL, "vg.dsl_vm.step_bound");
+    __CPROVER_assert(dsl_dec == ref_dec, "vg.dsl_vm.exact_three_valued_equivalence");
+    __CPROVER_assert((dsl_dec == SHADOW_BLOCK) == (ref_dec == SHADOW_BLOCK), "vg.dsl_vm.runtime_block_equivalence");
+    {' '.join(map_asserts)}
+    return 0;
+}}
+'''
+    val_code = f'''#include <stdio.h>
+#include <string.h>
+#include "autoshield.h"
+int safe_read(void *d, const void *s, size_t n) {{ (void)d; (void)s; (void)n; return -1; }}
+static const ebpf_insn dsl_insns[] = {{
+{insn_rows}
+}};
+int main(void) {{
+    shadow_program dsl_prog = {{dsl_insns, {len(rows)}, 0, 0}};
+    shadow_u64 max_steps = 0;
+    int vrc = shadow_program_validate(&dsl_prog);
+    int src = shadow_program_max_steps(&dsl_prog, &max_steps);
+    printf("%d %d %llu\\n", vrc, src, (unsigned long long)max_steps);
+    return (vrc == 0 && src == 0 && max_steps <= {step_limit}ULL) ? 0 : 1;
+}}
+#include "{ROOT / 'runtime/vm.c'}"
+'''
+    prefix = 'dsl_obs_equiv' if is_observer else 'dsl_vm_equiv'
+    sub_dir = output_dir / prefix
+    sub_dir.mkdir(parents=True, exist_ok=True)
+    val_c = sub_dir / f'{prefix}_validate.c'
+    val_bin = sub_dir / f'{prefix}_validate'
+    val_c.write_text(val_code, encoding='utf-8')
+    subprocess.run(['gcc', '-O2', str(val_c), '-I', str(ROOT / 'runtime'), '-o', str(val_bin)],
+                   check=True, timeout=timeout, capture_output=True, text=True)
+    val_run = subprocess.run([str(val_bin)], capture_output=True, text=True, timeout=timeout)
+    if val_run.returncode != 0:
+        return {
+            'id': mount_ir.get('id'),
+            'status': 'VIOLATED',
+            'checked_properties': 2,
+            'failed_properties': [{'property': 'vg.dsl_vm.validate', 'description': val_run.stdout.strip()}],
+            'bytecode_sha256': mount_ir.get('dsl_vm_bytecode_sha256'),
+            'bytecode_instructions': len(rows),
+            'has_bounded_loops': has_backedge,
+            'seconds': 0.05,
+        }
+    src_file = sub_dir / f'{prefix}.c'
+    goto_file = sub_dir / f'{prefix}.goto'
+    reduced_goto = sub_dir / f'{prefix}.reduced.goto'
+    src_file.write_text(c_code, encoding='utf-8')
+    tool_dir = cbmc_bin.parent
+    subprocess.run([str(tool_dir / 'goto-cc'), str(src_file), '-I', str(ROOT / 'runtime'), '-o', str(goto_file)],
+                   check=True, timeout=timeout, capture_output=True, text=True)
+    subprocess.run([str(tool_dir / 'goto-instrument'), '--drop-unused-functions', '--slice-global-inits',
+                    str(goto_file), str(reduced_goto)],
+                   check=True, timeout=timeout, capture_output=True, text=True)
+    map_unwind = 1
+    res = _run_cbmc_json(
+        reduced_goto, cbmc_bin, sub_dir,
+        unwind=map_unwind, timeout=timeout,
+        extra_flags=['--function', 'main'],
+    )
+    if res['status'] != 'completed' or res['unwind_failures']:
+        dsl_status = 'UNRESOLVED'
+    elif any(p.get('status') == 'FAILURE' for p in res['properties']):
+        dsl_status = 'VIOLATED'
+    else:
+        dsl_status = 'PROVED'
+    failed_props = [
+        {'property': p.get('property'), 'description': p.get('description')}
+        for p in res.get('properties', [])
+        if p.get('status') == 'FAILURE'
+    ]
+    return {
+        'id': mount_ir.get('id'),
+        'status': dsl_status,
+        'checked_properties': len(res.get('properties', [])),
+        'failed_properties': failed_props,
+        'bytecode_sha256': mount_ir.get('dsl_vm_bytecode_sha256'),
+        'bytecode_instructions': len(rows),
+        'has_bounded_loops': has_backedge,
+        'seconds': res.get('seconds', 0.0),
+    }
+
+
+def verify_dsl_observer_bytecode_equivalence(obs_ir: dict[str, Any],
+                                             cbmc_bin: Path,
+                                             output_dir: Path,
+                                             timeout: int = 90) -> dict[str, Any]:
+    res = _verify_dsl_vm_mount_equivalence(
+        obs_ir, is_observer=True, cbmc_bin=cbmc_bin, output_dir=output_dir, timeout=timeout,
+    )
+    (Path(output_dir) / 'observer-vm-equivalence.json').write_text(
+        json.dumps(res, indent=2) + '\n', encoding='utf-8',
+    )
+    return res
+
+
 def verify_vm_bytecode_equivalence(guard_ir: dict[str, Any],
                                    cbmc_bin: Path,
                                    output_dir: Path,
@@ -817,6 +1863,26 @@ int main(void) {{
         'proved_c_summary': rendered['summary_expr'] if status == 'PROVED' else None,
         'seconds': res.get('seconds', 0.0),
     }
+    if guard_ir.get('dsl_vm_rule_path') and guard_ir.get('dsl_ast'):
+        dsl_res = _verify_dsl_vm_mount_equivalence(
+            guard_ir, is_observer=False, cbmc_bin=cbmc_bin, output_dir=output_dir, timeout=timeout,
+        )
+        summary['dsl_vm_equivalence'] = dsl_res
+        summary['dsl_vm_bytecode_sha256'] = guard_ir.get('dsl_vm_bytecode_sha256')
+        summary['dsl_vm_bytecode_instructions'] = dsl_res['bytecode_instructions']
+        summary['has_bounded_loops'] = bool(summary['has_bounded_loops'] or dsl_res['has_bounded_loops'])
+        summary['checked_properties'] = int(summary['checked_properties']) + int(dsl_res['checked_properties'])
+        summary['seconds'] = float(summary['seconds']) + float(dsl_res['seconds'])
+        if dsl_res['status'] == 'VIOLATED' or status == 'VIOLATED':
+            summary['status'] = 'VIOLATED'
+            summary['proved_c_summary'] = None
+            summary['dsl_vm_proved'] = False
+        elif dsl_res['status'] != 'PROVED' or status != 'PROVED':
+            summary['status'] = 'UNRESOLVED'
+            summary['proved_c_summary'] = None
+            summary['dsl_vm_proved'] = False
+        else:
+            summary['dsl_vm_proved'] = True
     (output_dir / 'vm-equivalence.json').write_text(json.dumps(summary, indent=2) + '\n', encoding='utf-8')
     return summary
 
@@ -1085,10 +2151,15 @@ def demote_unbound_oracle(status: str, properties: list[dict[str, Any]]) -> str:
 
 _BUILTIN_MEMORY = (
     'dereference failure',
+    'dereferenced function pointer',
     'array bounds',
     'pointer overflow',
     'dead object',
     'invalid pointer',
+    'memcpy src/dst overlap',
+    'memcpy source region readable',
+    'memcpy destination region writeable',
+    'memset destination region writeable',
 )
 _BUILTIN_ARITHMETIC = (
     'arithmetic overflow',
@@ -1163,10 +2234,6 @@ def classify_obligation_status(prop_list: list[dict[str, Any]],
             other_unwind.append(prop)
     if not query_completed:
         return 'UNRESOLVED', []
-    if blocked_unwind and blocked_unwind_is_violation:
-        pass
-    elif other_unwind or blocked_unwind:
-        return 'UNRESOLVED', []
     failed = [p for p in prop_list if p.get('status') == 'FAILURE']
     if blocked_unwind_is_violation:
         for prop in blocked_unwind:
@@ -1182,7 +2249,7 @@ def classify_obligation_status(prop_list: list[dict[str, Any]],
             'site': counterexample_site(p),
         } for p in failed[:4]]
         return 'VIOLATED', ces
-    if other_unwind or not prop_list:
+    if other_unwind or blocked_unwind or not prop_list:
         return 'UNRESOLVED', []
     return 'PROVED_IN_BOUNDED_DOMAIN', []
 
@@ -1243,6 +2310,7 @@ def _local_continuation_properties(props: list[dict[str, Any]]) -> list[dict[str
             any(token in property_name for token in ('__vg_w1_', '__vulgate_action_'))
             and '.unwind.' not in property_name
             and not description.startswith('__VG_UNMODELED_INIT:')
+            and not description.startswith('__VG_REACH_SENSITIVE:')
             and 'vg.target.' not in description
         ):
             kept.append(prop)
@@ -1275,238 +2343,301 @@ def query_outside_caller_locals(case_ir: dict[str, Any],
     goto_cc = tool_dir / 'goto-cc'
     goto_instrument = tool_dir / 'goto-instrument'
     from .driver_synth import parse_c_function_signature
-    for task in plan.get('tasks') or []:
-        if task.get('role') != 'caller_local':
-            continue
-        function = str(task.get('cut_function') or '')
-        if not function or function in covering:
-            continue
-        safe_name = re.sub(r'[^A-Za-z0-9_]', '_', function)
-        work = output_dir / 'local_callers' / safe_name
-        work.mkdir(parents=True, exist_ok=True)
-        def _local_signature(source_path: Path) -> dict[str, Any] | None:
-            text = source_path.read_text(encoding='utf-8', errors='replace')
-            found = parse_c_function_signature(text, function)
-            if found:
-                return found
-            return parse_c_function_signature(text, function, include_static=True)
+    def _solve_local(task):
+            if task.get('role') != 'caller_local':
+                return
+            function = str(task.get('cut_function') or '')
+            if not function or function in covering:
+                return
+            safe_name = re.sub(r'[^A-Za-z0-9_]', '_', function)
+            work = output_dir / 'local_callers' / safe_name
+            work.mkdir(parents=True, exist_ok=True)
+            def _local_signature(source_path: Path) -> dict[str, Any] | None:
+                text = source_path.read_text(encoding='utf-8', errors='replace')
+                found = parse_c_function_signature(text, function)
+                if found:
+                    return found
+                return parse_c_function_signature(text, function, include_static=True)
 
-        signature = None
-        compile_sources = list(stamped_sources)
-        for source_path in stamped_sources:
-            try:
-                signature = _local_signature(source_path)
-            except OSError:
-                signature = None
-            if signature:
-                break
-        if signature is None:
-            raw_source = Path(str(task.get('source_file') or ''))
-            if raw_source.is_file():
+            signature = None
+            compile_sources = list(stamped_sources)
+            for source_path in stamped_sources:
                 try:
-                    signature = _local_signature(raw_source)
+                    signature = _local_signature(source_path)
                 except OSError:
                     signature = None
                 if signature:
-                    compile_sources.append(raw_source)
-        if signature is None:
-            task['local_obligation'] = {
-                'status': 'UNRESOLVED',
-                'reason': 'prototype_not_found',
-                'checked_properties': 0,
-            }
-            continue
-        scope = dict(case_ir.get('symbolization_scope') or {})
-        scope['slice_sources'] = [str(path) for path in compile_sources]
-        scope['cut_function'] = function
-        scope.pop('cut_harness_kind', None)
-        scope.pop('inline_driver_c', None)
-        local_case = dict(case_ir)
-        local_case['symbolization_scope'] = scope
-        driver_path = work / 'local_driver.c'
-        try:
-            synthesize_paired_goto_driver_c(
-                local_case,
-                {'base_name': function},
-                None,
-                driver_path,
-            )
-        except (KeyError, ValueError, OSError) as exc:
-            task['local_obligation'] = {
-                'status': 'UNRESOLVED',
-                'reason': 'driver_not_synthesized',
-                'detail': str(exc)[:300],
-                'checked_properties': 0,
-            }
-            continue
-        from .driver_synth import align_anonymous_signatures, stamp_allocator_callsites
-        exports = list(scope.get('static_exports') or [])
-        stamped_ids = {path.resolve() for path in stamped_sources}
-        if exports or any(path.resolve() not in stamped_ids for path in compile_sources):
-            materialized: list[Path] = []
-            for path in compile_sources:
-                matched = [
-                    str(item.get('source') or '')
-                    for item in exports
-                    if Path(str(item.get('file') or '')).resolve() == path.resolve()
-                    and str(item.get('source') or '')
-                ]
-                if path.resolve() in stamped_ids and not matched:
-                    materialized.append(path)
-                    continue
-                try:
-                    text = path.read_text(encoding='utf-8', errors='replace')
-                except OSError:
-                    materialized.append(path)
-                    continue
-                if path.resolve() not in stamped_ids:
-                    text = stamp_allocator_callsites(text)
-                text = align_anonymous_signatures(text, list(scope.get('anonymous_signatures') or []))
-                addition = ''.join(item for item in matched if item not in text)
-                if addition:
-                    text += '\n' + addition
-                dest = work / f'local_{path.name}'
-                dest.write_text(text, encoding='utf-8')
-                materialized.append(dest)
-            compile_sources = materialized
-        local_goto = work / 'local.goto'
-        local_linked = work / 'local_linked.goto'
-        try:
-            subprocess.run(
-                [str(goto_cc), *flags, *[str(path) for path in compile_sources], str(driver_path), str(helper_c_path),
-                 '--function', '__vg_verify_obligations', '-o', str(local_goto)],
-                check=True,
-                timeout=max(int(timeout_sec), 120),
-                capture_output=True,
-                text=True,
-            )
-            subprocess.run(
-                [str(goto_instrument), '--add-library', str(local_goto), str(local_linked)],
-                check=True,
-                timeout=120,
-                capture_output=True,
-                text=True,
-            )
-            local_functions, local_symbols = load_typed_goto_model(
-                local_linked, goto_instrument, work / 'inspect',
-            )
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
-            task['local_obligation'] = {
-                'status': 'UNRESOLVED',
-                'reason': 'compile_failed',
-                'detail': (getattr(exc, 'stderr', None) or str(exc))[-500:],
-                'checked_properties': 0,
-            }
-            continue
-        local_names = {item['name'] for item in local_functions}
-        subtree = [str(name) for name in (task.get('subtree_functions') or []) if str(name) in local_names]
-        if function in local_names and function not in subtree:
-            subtree.append(function)
-        local_icfg = build_enhanced_icfg(local_functions, local_symbols)
-        if function in local_icfg['functions_by_name']:
-            for reached in _reachable_from(local_icfg, function):
-                if reached in local_names and reached not in subtree:
-                    subtree.append(reached)
-        bridges = _harness_bridge_functions(local_functions, local_symbols, subtree)
-        clone_names = list(subtree)
-        for name in bridges:
-            if name not in clone_names:
-                clone_names.append(name)
-        cloned_fns, cloned_syms, world_maps = clone_dual_world_goto(
-            local_functions, local_symbols, clone_names,
-        )
-        resolved_specs = []
-        for spec in hook_weave_specs:
-            matches = [
-                item['name'] for item in local_functions
-                if local_symbols.get(item['name'], {}).get('baseName', item['name']) == spec.get('guard_base_name')
-                or item['name'] == spec.get('guard_ir_function')
+                    break
+            if signature is None:
+                raw_source = Path(str(task.get('source_file') or ''))
+                if raw_source.is_file():
+                    try:
+                        signature = _local_signature(raw_source)
+                    except OSError:
+                        signature = None
+                    if signature:
+                        compile_sources.append(raw_source)
+            if signature is None:
+                task['local_obligation'] = {
+                    'status': 'UNRESOLVED',
+                    'reason': 'prototype_not_found',
+                    'checked_properties': 0,
+                }
+                return
+            scope = dict(case_ir.get('symbolization_scope') or {})
+            scope['slice_sources'] = [str(path) for path in compile_sources]
+            scope['cut_function'] = function
+            scope.pop('cut_harness_kind', None)
+            scope.pop('inline_driver_c', None)
+            local_case = dict(case_ir)
+            local_case['symbolization_scope'] = scope
+            driver_path = work / 'local_driver.c'
+            try:
+                synthesize_paired_goto_driver_c(
+                    local_case,
+                    {'base_name': function},
+                    None,
+                    driver_path,
+                )
+            except (KeyError, ValueError, OSError) as exc:
+                task['local_obligation'] = {
+                    'status': 'UNRESOLVED',
+                    'reason': 'driver_not_synthesized',
+                    'detail': str(exc)[:300],
+                    'checked_properties': 0,
+                }
+                return
+            from .driver_synth import align_anonymous_signatures, stamp_allocator_callsites
+            exports = list(scope.get('static_exports') or [])
+            stamped_ids = {path.resolve() for path in stamped_sources}
+            if exports or any(path.resolve() not in stamped_ids for path in compile_sources):
+                materialized: list[Path] = []
+                for path in compile_sources:
+                    matched = [
+                        str(item.get('source') or '')
+                        for item in exports
+                        if Path(str(item.get('file') or '')).resolve() == path.resolve()
+                        and str(item.get('source') or '')
+                    ]
+                    if path.resolve() in stamped_ids and not matched:
+                        materialized.append(path)
+                        continue
+                    try:
+                        text = path.read_text(encoding='utf-8', errors='replace')
+                    except OSError:
+                        materialized.append(path)
+                        continue
+                    if path.resolve() not in stamped_ids:
+                        text = stamp_allocator_callsites(text)
+                    text = align_anonymous_signatures(text, list(scope.get('anonymous_signatures') or []))
+                    addition = ''.join(item for item in matched if item not in text)
+                    if addition:
+                        text += '\n' + addition
+                    dest = work / f'local_{path.name}'
+                    dest.write_text(text, encoding='utf-8')
+                    materialized.append(dest)
+                compile_sources = materialized
+            local_goto = work / 'local.goto'
+            local_linked = work / 'local_linked.goto'
+            try:
+                subprocess.run(
+                    [str(goto_cc), *flags, *[str(path) for path in compile_sources], str(driver_path), str(helper_c_path),
+                     '--function', '__vg_verify_obligations', '-o', str(local_goto)],
+                    check=True,
+                    timeout=max(int(timeout_sec), 120),
+                    capture_output=True,
+                    text=True,
+                )
+                subprocess.run(
+                    [str(goto_instrument), '--add-library', str(local_goto), str(local_linked)],
+                    check=True,
+                    timeout=120,
+                    capture_output=True,
+                    text=True,
+                )
+                local_reduced = work / 'local_reduced.goto'
+                drop = subprocess.run(
+                    [str(goto_instrument), '--drop-unused-functions', '--slice-global-inits',
+                     str(local_linked), str(local_reduced)],
+                    timeout=120,
+                    capture_output=True,
+                    text=True,
+                )
+                model_path = local_reduced if drop.returncode == 0 and local_reduced.is_file() else local_linked
+                local_functions, local_symbols = load_typed_goto_model(
+                    model_path, goto_instrument, work / 'inspect',
+                )
+                def _body_metadata_broken(item: dict[str, Any]) -> bool:
+                    body = item.get('instructions', [])
+                    return (
+                        not isinstance(body, list)
+                        or not body
+                        or type(item.get('isBodyAvailable')) is not bool
+                        or item.get('isBodyAvailable') != bool(body)
+                        or not isinstance(item.get('parameterIdentifiers'), list)
+                    )
+
+                present = {item.get('name'): item for item in local_functions}
+                donors: dict[str, dict[str, Any]] = {}
+                if local_linked.is_file():
+                    full_functions, full_symbols = load_typed_goto_model(
+                        local_linked, goto_instrument, work / 'inspect_template',
+                    )
+                    for item in full_functions:
+                        name = str(item.get('name') or '')
+                        if not name.startswith(('__vg_', '__vulgate_')) or not item.get('instructions'):
+                            continue
+                        if name not in present or _body_metadata_broken(present[name]):
+                            donors[name] = item
+                    if donors:
+                        restored = []
+                        seen = set()
+                        for item in local_functions:
+                            name = item.get('name')
+                            if name in donors:
+                                restored.append(donors[name])
+                                seen.add(name)
+                            else:
+                                restored.append(item)
+                        for name, donor in donors.items():
+                            if name not in seen:
+                                restored.append(donor)
+                        local_functions = restored
+                        for name in donors:
+                            donor_symbol = full_symbols.get(name)
+                            if donor_symbol is not None:
+                                local_symbols[name] = donor_symbol
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+                task['local_obligation'] = {
+                    'status': 'UNRESOLVED',
+                    'reason': 'compile_failed',
+                    'detail': (getattr(exc, 'stderr', None) or str(exc))[-500:],
+                    'checked_properties': 0,
+                }
+                return
+            local_veribin = apply_veribin_summaries(local_functions, local_symbols, case_ir, plan)
+            clone_names = [
+                name for name in local_veribin['subtree']
+                if any(item['name'] == name for item in local_functions)
             ]
-            for match in matches:
-                copied = dict(spec)
-                copied['guard_ir_function'] = match
-                resolved_specs.append(copied)
-        weaved_fns, weaved_syms = apply_paired_weaves(
-            cloned_fns, cloned_syms, world_maps['w1'], resolved_specs,
-            case_ir.get('observer_specs') or [], case_ir.get('maps') or {}, plan,
-        )
-        fn_by_name = {item['name']: item for item in weaved_fns}
-        from .paired_goto import _rewrite_irep_symbols
-        for harness_name, world_key in (('__vg_run_world_0', 'w0'), ('__vg_run_world_1', 'w1')):
-            harness = fn_by_name.get(harness_name)
-            if harness is None:
-                continue
-            for insn in harness.get('instructions', []):
-                if 'code' in insn:
-                    insn['code'] = _rewrite_irep_symbols(insn['code'], world_maps[world_key])
-                if 'guard' in insn:
-                    insn['guard'] = _rewrite_irep_symbols(insn['guard'], world_maps[world_key])
-        object_bits = initial_object_bits(driver_path.read_text(encoding='utf-8', errors='replace'))
-        paired_goto = work / 'paired.goto'
-        use_shadow = shadow_enabled and object_bits < 14
-        export_fns = deepcopy(weaved_fns)
-        export_syms = deepcopy(weaved_syms)
-        try:
-            finalize_and_export_goto(
-                export_fns, export_syms, paired_goto, tool_dir, work / 'export',
-                enable_shadow=use_shadow, object_bits=object_bits, timeout=timeout_sec,
+            cloned_fns, cloned_syms, world_maps = clone_dual_world_goto(
+                local_functions, local_symbols, clone_names,
             )
-            solved = _run_cbmc_json(
-                paired_goto, cbmc_bin, work / 'query',
-                unwind=unwind, object_bits=object_bits, timeout=timeout_sec,
-                extra_flags=_obligation_query_flags(case_ir),
+            resolved_specs = []
+            for spec in hook_weave_specs:
+                matches = [
+                    item['name'] for item in local_functions
+                    if local_symbols.get(item['name'], {}).get('baseName', item['name']) == spec.get('guard_base_name')
+                    or item['name'] == spec.get('guard_ir_function')
+                ]
+                for match in matches:
+                    copied = dict(spec)
+                    copied['guard_ir_function'] = match
+                    resolved_specs.append(copied)
+            weaved_fns, weaved_syms = apply_paired_weaves(
+                cloned_fns, cloned_syms, world_maps['w1'], resolved_specs,
+                case_ir.get('observer_specs') or [], case_ir.get('maps') or {}, plan,
             )
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, RuntimeError, TransportError) as exc:
-            task['local_obligation'] = {
-                'status': 'UNRESOLVED',
-                'reason': 'query_failed',
-                'detail': str(exc)[:300],
-                'checked_properties': 0,
-            }
-            continue
-        if solved.get('status') != 'completed' and use_shadow:
+            fn_by_name = {item['name']: item for item in weaved_fns}
+            from .paired_goto import _rewrite_irep_symbols
+            for harness_name, world_key in (('__vg_run_world_0', 'w0'), ('__vg_run_world_1', 'w1')):
+                harness = fn_by_name.get(harness_name)
+                if harness is None:
+                    continue
+                for insn in harness.get('instructions', []):
+                    if 'code' in insn:
+                        insn['code'] = _rewrite_irep_symbols(insn['code'], world_maps[world_key])
+                    if 'guard' in insn:
+                        insn['guard'] = _rewrite_irep_symbols(insn['guard'], world_maps[world_key])
+            object_bits = initial_object_bits(driver_path.read_text(encoding='utf-8', errors='replace'))
+            paired_goto = work / 'paired.goto'
+            use_shadow = shadow_enabled and object_bits < 14
+            export_fns = deepcopy(weaved_fns)
+            export_syms = deepcopy(weaved_syms)
+            from ..verification.shadow import SpecificationError
             try:
                 finalize_and_export_goto(
-                    weaved_fns, weaved_syms, paired_goto, tool_dir, work / 'export_noshadow',
-                    enable_shadow=False, object_bits=object_bits, timeout=timeout_sec,
+                    export_fns, export_syms, paired_goto, tool_dir, work / 'export',
+                    enable_shadow=use_shadow, object_bits=object_bits, timeout=timeout_sec,
                 )
+                local_unwind = min(int(unwind), 8)
+                local_timeout = min(int(timeout_sec), 60)
+                local_flags = list(_obligation_query_flags(case_ir))
+                if not use_shadow:
+                    local_flags.extend(_noshadow_query_flags(case_ir))
                 solved = _run_cbmc_json(
-                    paired_goto, cbmc_bin, work / 'query_noshadow',
-                    unwind=unwind, object_bits=object_bits, timeout=timeout_sec,
-                    extra_flags=_obligation_query_flags(case_ir),
+                    paired_goto, cbmc_bin, work / 'query',
+                    unwind=local_unwind, object_bits=object_bits, timeout=local_timeout,
+                    extra_flags=local_flags,
+                    memory_bytes=6 * 1024 * 1024 * 1024,
                 )
-                solved['shadow_fallback'] = True
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, RuntimeError, TransportError) as exc:
-                solved = {'status': 'incomplete', 'reason': str(exc)[:300], 'properties': []}
-        props = list(solved.get('properties') or [])
-        status, examples = classify_obligation_status(
-            _local_continuation_properties(props),
-            list(solved.get('unwind_failures') or []),
-            solved.get('status') == 'completed',
-            blocked_unwind_is_violation=True,
-        )
-        harness_sites = {
-            '__vg_verify_obligations', '__vg_impact_harness',
-            '__vg_run_world_0', '__vg_run_world_1', 'vg_proto_entry',
-        }
-        caller_examples = [
-            item for item in examples
-            if str((item.get('site') or {}).get('function') or '') not in harness_sites
-        ]
-        if status == 'VIOLATED' and examples and not caller_examples:
-            status = 'PROVED_IN_BOUNDED_DOMAIN'
-        status = demote_unbound_oracle(status, props)
-        task['local_obligation'] = {
-            'status': status,
-            'reason': solved.get('reason'),
-            'checked_properties': len(props),
-            'shadow_fallback': bool(solved.get('shadow_fallback')),
-            'failures': [
-                f"{item.get('description')}@{((item.get('site') or {}).get('function'))}"
-                for item in caller_examples
-            ],
-        }
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, RuntimeError, TransportError, KeyError, SpecificationError) as exc:
+                task['local_obligation'] = {
+                    'status': 'UNRESOLVED',
+                    'reason': 'query_failed',
+                    'detail': str(exc)[:300],
+                    'checked_properties': 0,
+                }
+                shutil.rmtree(work, ignore_errors=True)
+                gc.collect()
+                return
+            if solved.get('status') != 'completed' and use_shadow:
+                try:
+                    finalize_and_export_goto(
+                        weaved_fns, weaved_syms, paired_goto, tool_dir, work / 'export_noshadow',
+                        enable_shadow=False, object_bits=object_bits, timeout=timeout_sec,
+                    )
+                    solved = _run_cbmc_json(
+                        paired_goto, cbmc_bin, work / 'query_noshadow',
+                        unwind=local_unwind, object_bits=object_bits, timeout=local_timeout,
+                        extra_flags=[*_obligation_query_flags(case_ir), *_noshadow_query_flags(case_ir)],
+                        memory_bytes=6 * 1024 * 1024 * 1024,
+                    )
+                    solved['shadow_fallback'] = True
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, RuntimeError, TransportError, KeyError, SpecificationError) as exc:
+                    solved = {'status': 'incomplete', 'reason': str(exc)[:300], 'properties': []}
+            props = list(solved.get('properties') or [])
+            status, examples = classify_obligation_status(
+                _local_continuation_properties(props),
+                list(solved.get('unwind_failures') or []),
+                solved.get('status') == 'completed',
+                blocked_unwind_is_violation=True,
+            )
+            harness_sites = {
+                '__vg_verify_obligations', '__vg_impact_harness',
+                '__vg_run_world_0', '__vg_run_world_1', 'vg_proto_entry',
+            }
+            caller_examples = [
+                item for item in examples
+                if str((item.get('site') or {}).get('function') or '') not in harness_sites
+            ]
+            if status == 'VIOLATED' and examples and not caller_examples:
+                status = 'PROVED_IN_BOUNDED_DOMAIN'
+            status = demote_unbound_oracle(status, props)
+            task['local_obligation'] = {
+                'status': status,
+                'reason': solved.get('reason'),
+                'checked_properties': len(props),
+                'shadow_fallback': bool(solved.get('shadow_fallback')),
+                'failures': [
+                    f"{item.get('description')}@{((item.get('site') or {}).get('function'))}"
+                    for item in caller_examples
+                ],
+            }
+            shutil.rmtree(work, ignore_errors=True)
+            gc.collect()
 
+
+
+    locals_to_solve = [
+        task for task in (plan.get('tasks') or [])
+        if task.get('role') == 'caller_local'
+        and str(task.get('cut_function') or '')
+        and str(task.get('cut_function') or '') not in covering
+    ]
+    workers = min(3, os.cpu_count() or 2)
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        list(pool.map(_solve_local, locals_to_solve))
 
 def single_covering_base(plan: dict[str, Any] | None) -> str | None:
     names: list[str] = []
@@ -1572,6 +2703,14 @@ def retarget_driver_to_covering_cut(case_ir: dict[str, Any],
                                     check_length_truncation: bool,
                                     ) -> tuple[dict[str, Any], Path, list[dict[str, Any]], dict[str, Any]] | None:
     scope = case_ir.setdefault('symbolization_scope', {})
+    from .driver_synth import (
+        _signature_for_cut,
+        _static_signature_in_sources,
+        driver_prefers_kind_harness,
+        prefer_slice_function_bodies,
+    )
+    if driver_prefers_kind_harness(case_ir.get('safety_oracle') or {}, scope):
+        return None
     planned = covering_driver_target(
         plan,
         str(scope.get('driver_entry') or ''),
@@ -1581,7 +2720,6 @@ def retarget_driver_to_covering_cut(case_ir: dict[str, Any],
     )
     if not planned:
         return None
-    from .driver_synth import _signature_for_cut, _static_signature_in_sources, prefer_slice_function_bodies
     if _signature_for_cut(scope, planned) is None and _static_signature_in_sources(scope, planned)[0] is None:
         return None
     saved_driver = driver_path.read_text(encoding='utf-8')
@@ -1693,6 +2831,15 @@ def build_and_verify_paired_goto_slice(case_ir: dict[str, Any],
         )
         slice_sources = [*slice_sources, *admitted]
         already.update(path.resolve() for path in admitted)
+        if admitted:
+            scope = case_ir.setdefault('symbolization_scope', {})
+            listed = [str(item) for item in (scope.get('slice_sources') or [])]
+            for path in admitted:
+                text = str(path)
+                if text not in listed:
+                    listed.append(text)
+            scope['slice_sources'] = listed
+            case_sym_cfg = scope
 
     definition_names: list[str] = []
     declared_cut = str(case_sym_cfg.get('cut_function') or '')
@@ -1702,6 +2849,13 @@ def build_and_verify_paired_goto_slice(case_ir: dict[str, Any],
         guard_name = str(guard.get('function') or '')
         if guard_name and guard_name not in definition_names:
             definition_names.append(guard_name)
+        caller_name = str(guard.get('caller') or '')
+        if caller_name and caller_name not in definition_names:
+            definition_names.append(caller_name)
+    for obs_spec in [*(case_ir.get('observers') or []), *(case_ir.get('observer_specs') or [])]:
+        obs_fn = str(obs_spec.get('function') or (obs_spec.get('dsl_callsite') or {}).get('caller') or '')
+        if obs_fn and obs_fn not in definition_names:
+            definition_names.append(obs_fn)
     if definition_names and not (case_sym_cfg.get('slice_driver_c') or sym_cfg.get('slice_driver_c')):
         from .driver_synth import discover_definition_files
         defined = [
@@ -1780,12 +2934,21 @@ def build_and_verify_paired_goto_slice(case_ir: dict[str, Any],
             case_sym_cfg = scope
             already.update(path.resolve() for path in admitted_callees)
 
+    if (
+        str(case_sym_cfg.get('cut_harness_kind') or '') == 'brotli_stream_refill'
+        and not str(case_sym_cfg.get('cut_function') or '')
+    ):
+        from .driver_synth import _signature_for_cut
+        if _signature_for_cut(case_sym_cfg, 'BrotliDecoderDecompressStream') is not None:
+            case_sym_cfg['cut_function'] = 'BrotliDecoderDecompressStream'
+
     abstract_snap: dict[str, Any] | None = None
     explicit_driver_cut = str(case_sym_cfg.get('cut_function') or '')
     base_harness_c = case_sym_cfg.get('slice_driver_c') or sym_cfg.get('slice_driver_c')
     if base_harness_c:
         driver_path = Path(base_harness_c).resolve() if Path(base_harness_c).exists() else (ROOT / base_harness_c).resolve()
     elif case_sym_cfg.get('cut_harness_kind') or case_sym_cfg.get('inline_driver_c') or case_ir['app_profile'].get('family'):
+        bind_accessed_members(case_sym_cfg, list(case_ir.get('guards') or []), slice_sources, flags)
         abstract_snap = lift_snapshot_to_abstract_spec(
             case_sym_cfg.get('concrete_snapshot'),
             case_sym_cfg,
@@ -1884,6 +3047,31 @@ def build_and_verify_paired_goto_slice(case_ir: dict[str, Any],
         cap = min(int(mdef.get('capacity', 16)), 16)
         guard_helpers_c.extend(render_map_table_helpers(mname, cap, str(mdef.get('on_full') or 'drop')))
 
+    for obs in case_ir.get('observers') or []:
+        if not obs.get('dsl_operations'):
+            continue
+        oid = re.sub(r'[^A-Za-z0-9_]', '_', str(obs.get('id') or 'obs'))
+        obs_args = [int(x) for x in (obs.get('arg_indices') or [])]
+        obs_locals = [str(x) for x in (obs.get('local_names') or [])]
+        obs_params = [
+            *[f'uint64_t __vg_oa_{pos}' for pos in range(len(obs_args))],
+            *[f'uint64_t __vg_ol_{pos}' for pos in range(len(obs_locals))],
+        ]
+        obs_sig = ', '.join(obs_params) if obs_params else 'void'
+        obs_gen = _DslAstCGenerator(
+            mode='paired_obs',
+            obs_arg_indices=obs_args,
+            obs_local_names=obs_locals,
+        )
+        obs_gen.emit_operations(list(obs['dsl_operations']))
+        guard_helpers_c.append('\n'.join([
+            f'void __vulgate_obs_{oid}({obs_sig}) {{',
+            '    int __vg_abort = 0;',
+            *['    ' + line for line in obs_gen.lines],
+            '}',
+        ]))
+
+    paired_dsl_globals: dict[str, int] = {}
     hook_weave_specs: list[dict[str, Any]] = []
     loop_chunks = []
     if driver_path.is_file():
@@ -1912,65 +3100,138 @@ def build_and_verify_paired_goto_slice(case_ir: dict[str, Any],
         ret_c_type = {'int': 'int', 'uint': 'unsigned int', 'int64': 'int64_t', 'uint64': 'uint64_t',
                       'pointer': 'void *', 'void': 'void'}[g['return_type']]
 
-        sel_assigns = []
-        for f_name, f_bind in g['fields'].items():
-            if 'constant' in f_bind:
-                sel_assigns.append(f'uint64_t __vg_f_{f_name} = UINT64_C({int(f_bind["constant"])});')
-            elif f_bind['source'] == 'reg':
-                # Caller-local selector: the guard reads a register slot.  The
-                # symbolic domain treats the local as a free input.
-                sel_assigns.append(f'uint64_t __vg_f_{f_name} = __vulgate_nondet_u64();')
-                sel_assigns.append(f'ctx.regs[{int(f_bind["index"])}] = __vg_f_{f_name};')
-            elif f_bind['source'] == 'arg':
-                raw_s = list(g['selectors'].values())[f_bind['index']]
-                if raw_s.get('reads'):
-                    _expr, checks = _selector_c_expr(raw_s, param_names)
-                    sel_assigns.extend(checks)
-                if 'c_param_expr' in raw_s:
-                    sel_assigns.append(f'uint64_t __vg_f_{f_name} = (uint64_t)({raw_s["c_param_expr"]});')
-                elif 'symbolic_var_expr' in raw_s:
-                    ext_decl = raw_s.get('symbolic_var_decl')
-                    if ext_decl and ext_decl not in guard_helpers_c:
-                        guard_helpers_c.insert(6, ext_decl)
-                    sel_assigns.append(f'uint64_t __vg_f_{f_name} = (uint64_t)({raw_s["symbolic_var_expr"]});')
-                else:
-                    cexpr, checks = _selector_c_expr(g['resolved_vm_args'][f_bind['index']], param_names)
-                    if not raw_s.get('reads'):
-                        sel_assigns.extend(checks)
-                    sel_assigns.append(f'uint64_t __vg_f_{f_name} = {cexpr};')
-                sel_assigns.append(f'ctx.args[{f_bind["index"]}] = __vg_f_{f_name};')
-
-        map_read_stmts = []
-        for mr_index, mr in enumerate(g.get('map_reads', [])):
-            structured = structured_map_load_lines(mr, param_names, mr_index)
-            if structured:
-                map_read_stmts.extend(structured)
-                continue
-            mname = mr['map']
-            if isinstance(mr.get('key'), dict) and mr['key'].get('reads'):
-                key_c, key_checks = _selector_c_expr(mr['key'], param_names)
-                map_read_stmts.extend(key_checks)
-            else:
-                key_c = f'(uint64_t)(uintptr_t)({param_names[mr.get("key_arg", 0)]})'
-            slot_i = int(mr['slot'])
-            cons_i = 1 if mr.get('consume') else 0
-            map_read_stmts.append(f'uint64_t __vg_mval_{slot_i} = 0;')
-            map_read_stmts.append(f'int __vg_mfound_{slot_i} = __vulgate_table_get_{mname}(0, {key_c}, &__vg_mval_{slot_i}, {cons_i});')
-            map_read_stmts.append(f'ctx.regs[{slot_i}] = __vg_mval_{slot_i};')
-            if 'present_slot' in mr:
-                map_read_stmts.append(f'ctx.regs[{int(mr["present_slot"])}] = (uint64_t)__vg_mfound_{slot_i};')
-            elif mr.get('on_missing') != 'pass':
-                map_read_stmts.append(f'if (!__vg_mfound_{slot_i}) return 1;')
-
-        for f_name, f_bind in g['fields'].items():
-            if f_bind.get('source') == 'slot':
-                sel_assigns.append(f'uint64_t __vg_f_{f_name} = ctx.regs[{int(f_bind["index"])}];')
-
+        dec_fn_name = f'__vulgate_decide_{gid}'
+        act_fn_name = f'__vulgate_action_{gid}'
         vmp = vm_proofs.get(g['id'], {})
-        if vmp.get('proved_c_summary'):
-            decide_body = f'return !!({vmp["proved_c_summary"]});'
+
+        if g.get('dsl_ast'):
+            dsl_ok = (not vmp) or bool(vmp.get('dsl_vm_proved', vmp.get('status') == 'PROVED'))
+            if dsl_ok:
+                dsl_ast = g['dsl_ast']
+                g_gen = _DslAstCGenerator(
+                    mode='paired_guard',
+                    selectors=dict(dsl_ast.get('selectors') or {}),
+                    param_names=param_names,
+                )
+                g_gen.emit_loops(list(dsl_ast.get('loops') or []))
+                g_cond = g_gen.emit_condition(dsl_ast['condition'])
+                guard_helpers_c.append('\n'.join([
+                    f'int {dec_fn_name}({sig_params}) {{',
+                    f'    {" ".join(map_full_block_lines(case_ir, g))}',
+                    '    int __vg_abort = 0;',
+                    *['    ' + line for line in g_gen.lines],
+                    '    if (__vg_abort) return 0;',
+                    f'    return {g_cond} ? 1 : 0;',
+                    '}',
+                ]))
+            else:
+                dsl_raw = Path(g['dsl_vm_rule_path']).read_bytes()
+                dsl_rows = list(struct.iter_unpack('<BBhi', dsl_raw))
+                dsl_lit = ','.join('{%d,%d,%d,%d}' % r for r in dsl_rows)
+                for gk, gv in (g.get('dsl_vm_globals') or {}).items():
+                    paired_dsl_globals[str(gk)] = int(gv)
+                arg_fills = [
+                    f'ctx.args[{p_i}] = (uint64_t)(uintptr_t)({pname});'
+                    for p_i, pname in enumerate(param_names[:6])
+                ]
+                vm_maps = list(g.get('dsl_vm_maps') or [])
+                sync_in: list[str] = []
+                sync_out: list[str] = []
+                if vm_maps:
+                    sync_in.append(f'shadow_map __vg_smaps[{len(vm_maps)}] = {{{{0}}}};')
+                    for m_i, ms in enumerate(vm_maps):
+                        mn = str(ms.get('id') or ms.get('name'))
+                        mcap = min(int(case_ir.get('maps', {}).get(mn, {}).get('capacity', 16)), 16)
+                        sync_in.append(f'shadow_map_entry __vg_sent_{m_i}[{mcap}] = {{{{0}}}};')
+                        sync_in.append(
+                            f'__vg_smaps[{m_i}].capacity = {mcap}U; __vg_smaps[{m_i}].entries = __vg_sent_{m_i}; '
+                            f'for (unsigned __si = 0; __si < {mcap}U; ++__si) {{ '
+                            f'if (__vulgate_map_slots_{mn}[__si].used) {{ '
+                            f'__vg_sent_{m_i}[__si].used = 1U; '
+                            f'__vg_sent_{m_i}[__si].key = __vulgate_map_slots_{mn}[__si].key; '
+                            f'__vg_sent_{m_i}[__si].value = __vulgate_map_slots_{mn}[__si].value; '
+                            f'__vg_smaps[{m_i}].count++; }} }}'
+                        )
+                        sync_out.append(
+                            f'__vulgate_map_{mn}.count = 0U; '
+                            f'for (unsigned __si = 0; __si < {mcap}U; ++__si) {{ '
+                            f'memset(&__vulgate_map_slots_{mn}[__si], 0, sizeof(vg_slot)); '
+                            f'if (__vg_sent_{m_i}[__si].used) {{ '
+                            f'(void)__vulgate_table_set_{mn}(0ULL, __vg_sent_{m_i}[__si].key, __vg_sent_{m_i}[__si].value); }} }}'
+                        )
+                    sync_in.append(f'ctx.maps = __vg_smaps; ctx.map_count = {len(vm_maps)}U;')
+                guard_helpers_c.append(f'''
+int {dec_fn_name}({sig_params}) {{
+    shadow_ctx ctx;
+    shadow_ctx_init(&ctx);
+    {' '.join(arg_fills)}
+    {' '.join(sync_in)}
+    static const ebpf_insn insns[] = {{{dsl_lit}}};
+    shadow_program prog = {{insns, {len(dsl_rows)}, 0, 0}};
+    shadow_policy pol = {{{g["step_limit"]}ULL, SHADOW_UNKNOWN_BLOCK, 0}};
+    shadow_stats st;
+    shadow_decision dec = run_ebpf_vm(&ctx, &prog, &pol, &st);
+    {' '.join(sync_out)}
+    return dec == SHADOW_BLOCK;
+}}
+''')
         else:
-            decide_body = f'''
+            sel_assigns = []
+            for f_name, f_bind in g['fields'].items():
+                if 'constant' in f_bind:
+                    sel_assigns.append(f'uint64_t __vg_f_{f_name} = UINT64_C({int(f_bind["constant"])});')
+                elif f_bind['source'] == 'reg':
+                    sel_assigns.append(f'uint64_t __vg_f_{f_name} = __vulgate_nondet_u64();')
+                    sel_assigns.append(f'ctx.regs[{int(f_bind["index"])}] = __vg_f_{f_name};')
+                elif f_bind['source'] == 'arg':
+                    raw_s = list(g['selectors'].values())[f_bind['index']]
+                    if raw_s.get('reads'):
+                        _expr, checks = _selector_c_expr(raw_s, param_names)
+                        sel_assigns.extend(checks)
+                    if 'c_param_expr' in raw_s:
+                        sel_assigns.append(f'uint64_t __vg_f_{f_name} = (uint64_t)({raw_s["c_param_expr"]});')
+                    elif 'symbolic_var_expr' in raw_s:
+                        ext_decl = raw_s.get('symbolic_var_decl')
+                        if ext_decl and ext_decl not in guard_helpers_c:
+                            guard_helpers_c.insert(6, ext_decl)
+                        sel_assigns.append(f'uint64_t __vg_f_{f_name} = (uint64_t)({raw_s["symbolic_var_expr"]});')
+                    else:
+                        cexpr, checks = _selector_c_expr(g['resolved_vm_args'][f_bind['index']], param_names)
+                        if not raw_s.get('reads'):
+                            sel_assigns.extend(checks)
+                        sel_assigns.append(f'uint64_t __vg_f_{f_name} = {cexpr};')
+                    sel_assigns.append(f'ctx.args[{f_bind["index"]}] = __vg_f_{f_name};')
+
+            map_read_stmts = []
+            for mr_index, mr in enumerate(g.get('map_reads', [])):
+                structured = structured_map_load_lines(mr, param_names, mr_index)
+                if structured:
+                    map_read_stmts.extend(structured)
+                    continue
+                mname = mr['map']
+                if isinstance(mr.get('key'), dict):
+                    key_c, key_checks = _selector_c_expr(mr['key'], param_names)
+                    map_read_stmts.extend(key_checks)
+                else:
+                    key_c = f'(uint64_t)(uintptr_t)({param_names[mr.get("key_arg", 0)]})'
+                slot_i = int(mr['slot'])
+                cons_i = 1 if mr.get('consume') else 0
+                map_read_stmts.append(f'uint64_t __vg_mval_{slot_i} = 0;')
+                map_read_stmts.append(f'int __vg_mfound_{slot_i} = __vulgate_table_get_{mname}(0, {key_c}, &__vg_mval_{slot_i}, {cons_i});')
+                map_read_stmts.append(f'ctx.regs[{slot_i}] = __vg_mval_{slot_i};')
+                if 'present_slot' in mr:
+                    map_read_stmts.append(f'ctx.regs[{int(mr["present_slot"])}] = (uint64_t)__vg_mfound_{slot_i};')
+                elif mr.get('on_missing') != 'pass':
+                    map_read_stmts.append(f'if (!__vg_mfound_{slot_i}) return 1;')
+
+            for f_name, f_bind in g['fields'].items():
+                if f_bind.get('source') == 'slot':
+                    sel_assigns.append(f'uint64_t __vg_f_{f_name} = ctx.regs[{int(f_bind["index"])}];')
+
+            if vmp.get('proved_c_summary'):
+                decide_body = f'return !!({vmp["proved_c_summary"]});'
+            else:
+                decide_body = f'''
     static const ebpf_insn insns[] = {{{insn_lit}}};
     shadow_program prog = {{insns, {len(rows)}, 0, 0}};
     shadow_policy pol = {{{g["step_limit"]}ULL, SHADOW_UNKNOWN_BLOCK, 0}};
@@ -1978,10 +3239,7 @@ def build_and_verify_paired_goto_slice(case_ir: dict[str, Any],
     shadow_decision dec = run_ebpf_vm(&ctx, &prog, &pol, &st);
     return dec != SHADOW_PASS;
 '''
-
-        dec_fn_name = f'__vulgate_decide_{gid}'
-        act_fn_name = f'__vulgate_action_{gid}'
-        guard_helpers_c.append(f'''
+            guard_helpers_c.append(f'''
 int {dec_fn_name}({sig_params}) {{
     shadow_ctx ctx;
     shadow_ctx_init(&ctx);
@@ -2047,10 +3305,66 @@ int {dec_fn_name}({sig_params}) {{
 
     guard_helpers_c.append(f'#include "{ROOT / "runtime/vm.c"}"')
     guard_helpers_c.append(f'#include "{ROOT / "runtime/experiment/state.c"}"')
-    guard_helpers_c.append('int safe_read(void *d, const void *s, size_t n) { if (!d || !s) return -1; memcpy(d, s, n); return 0; }')
+    sr_clauses = ['if (!d || !s || n == 0) return -1;']
+    for gk, gv in paired_dsl_globals.items():
+        gaddr = int(gv) & ((1 << 64) - 1)
+        sr_clauses.append(
+            f'if ((uint64_t)(uintptr_t)s >= UINT64_C({gaddr}) && '
+            f'(uint64_t)(uintptr_t)s + (uint64_t)n <= UINT64_C({gaddr}) + sizeof({gk})) {{ '
+            f'memcpy(d, ((const char *)&{gk}) + ((uint64_t)(uintptr_t)s - UINT64_C({gaddr})), n); return 0; }}'
+        )
+    sr_clauses.append('if (!__CPROVER_r_ok(s, n)) return -1;')
+    sr_clauses.append('memcpy(d, s, n); return 0;')
+    guard_helpers_c.append('int safe_read(void *d, const void *s, size_t n) { ' + ' '.join(sr_clauses) + ' }')
 
     helper_c_path = output_dir / 'vg_paired_helpers.c'
     helper_c_path.write_text('\n'.join(guard_helpers_c) + '\n', encoding='utf-8')
+
+    def _declare_missing_helper_globals(err_text: str) -> bool:
+        if 'vg_paired_helpers.c' not in err_text:
+            return False
+        missing = set(re.findall(r"symbol [`']([A-Za-z_]\w*)' not found", err_text))
+        missing.update(re.findall(r"[`']([A-Za-z_]\w*)' undeclared", err_text))
+        if not missing:
+            return False
+        current_helper = helper_c_path.read_text(encoding='utf-8', errors='replace')
+        added_lines: list[str] = []
+        if driver_path.is_file():
+            drv_text = driver_path.read_text(encoding='utf-8', errors='replace')
+            for inc_m in re.finditer(r'^\s*#\s*include\s+([<"][^>"]+[>"])', drv_text, re.M):
+                inc_tok = inc_m.group(1)
+                if inc_tok.endswith('.c"') or inc_tok.endswith('.c>'):
+                    continue
+                inc_line = f'#include {inc_tok}'
+                if inc_line not in current_helper and inc_line not in added_lines:
+                    added_lines.append(inc_line)
+        for sym_nm in sorted(missing):
+            if re.search(rf'\bextern\b[^;\n]*\b{re.escape(sym_nm)}\b', current_helper):
+                continue
+            found_decl = None
+            for src_p in [driver_path, *stamped_sources]:
+                if not src_p.is_file():
+                    continue
+                stxt = src_p.read_text(encoding='utf-8', errors='replace')
+                dm = re.search(
+                    rf'^\s*(?:extern\s+)?((?:const\s+|struct\s+|union\s+|unsigned\s+|signed\s+)*[A-Za-z_]\w*(?:\s*\*+)?)\s+{re.escape(sym_nm)}\s*(\[[^\];]*\])?\s*(?:=|;)',
+                    stxt,
+                    re.M,
+                )
+                if dm:
+                    arr_part = dm.group(2) or ''
+                    found_decl = f'extern {dm.group(1).strip()} {sym_nm}{arr_part};'
+                    break
+            if found_decl and found_decl not in current_helper and found_decl not in added_lines:
+                added_lines.append(found_decl)
+            elif not added_lines:
+                fallback_decl = f'extern unsigned char {sym_nm}[];'
+                if fallback_decl not in current_helper:
+                    added_lines.append(fallback_decl)
+        if not added_lines:
+            return False
+        helper_c_path.write_text('\n'.join(added_lines) + '\n' + current_helper, encoding='utf-8')
+        return True
 
     base_goto = output_dir / 'slice_base.goto'
     compile_timeout = case_ir['budgets']['solver_timeout_sec']
@@ -2061,7 +3375,10 @@ int {dec_fn_name}({sig_params}) {{
             subprocess.run(compile_cmd, check=True, timeout=compile_timeout, capture_output=True, text=True)
             break
         except subprocess.CalledProcessError as exc:
-            (output_dir / 'goto-cc.stderr').write_text((exc.stderr or '') + (exc.stdout or ''), encoding='utf-8')
+            err_blob = (exc.stderr or '') + (exc.stdout or '')
+            (output_dir / 'goto-cc.stderr').write_text(err_blob, encoding='utf-8')
+            if _declare_missing_helper_globals(err_blob):
+                continue
             if not declare_unlinked_snapshot_symbols(driver_path, exc.stderr or ''):
                 raise
     else:
@@ -2174,17 +3491,9 @@ int {dec_fn_name}({sig_params}) {{
                 encoding='utf-8',
             )
 
-    all_task_subtrees: list[str] = []
-    for t_obj in plan['tasks']:
-        if t_obj.get('role') not in (None, 'covering_cut'):
-            continue
-        for fn_nm in t_obj['subtree_functions']:
-            if fn_nm not in all_task_subtrees:
-                all_task_subtrees.append(fn_nm)
-    harness_bridges = _harness_bridge_functions(functions, symbols, all_task_subtrees)
-    for fn_nm in harness_bridges:
-        if fn_nm not in all_task_subtrees:
-            all_task_subtrees.append(fn_nm)
+    veribin_meta = apply_veribin_summaries(functions, symbols, case_ir, plan)
+    all_task_subtrees = list(veribin_meta['subtree'])
+    harness_bridges = list(all_task_subtrees)
 
     cloned_fns, cloned_syms, world_maps = clone_dual_world_goto(
         functions, symbols, all_task_subtrees
@@ -2219,10 +3528,45 @@ int {dec_fn_name}({sig_params}) {{
     paired_goto = output_dir / 'paired_dual_world.goto'
     object_bits = initial_object_bits(driver_path.read_text(encoding='utf-8', errors='replace'))
     shadow_enabled = bool(case_sym_cfg.get('enable_uninitialized_shadow', True))
-    unwind = int(case_ir['budgets']['loop_unwind'])
+    unwind = min(int(case_ir['budgets']['loop_unwind']), int(veribin_meta['loop_unwind']))
     timeout_sec = max(int(case_ir['budgets']['solver_timeout_sec']), 1200 if object_bits >= 14 else 600)
+    hybrid_points = concrete_neighborhood(input_domains(driver_path.read_text(encoding='utf-8', errors='replace')))
+    hybrid_ran = False
 
-    if shadow_enabled and object_bits >= 14:
+    if hybrid_points:
+        def _export_pinned(fns: list[dict[str, Any]], syms: dict[str, Any], goto_path: Path, export_dir: Path) -> dict[str, Any]:
+            return finalize_and_export_goto(
+                fns, syms, goto_path, tool_dir, export_dir,
+                enable_shadow=False, object_bits=object_bits,
+                timeout=HYBRID_STAGE_TIMEOUT_SEC,
+                timeout_floor=HYBRID_STAGE_TIMEOUT_SEC,
+            )
+
+        def _run_pinned(goto_path: Path, query_dir: Path) -> dict[str, Any]:
+            return _run_cbmc_json(
+                goto_path, cbmc_bin, query_dir,
+                unwind=unwind, object_bits=object_bits, timeout=HYBRID_STAGE_TIMEOUT_SEC,
+                extra_flags=[*_obligation_query_flags(case_ir), *_noshadow_query_flags(case_ir)],
+            )
+
+        o2_o3_res = run_hybrid_neighborhood(
+            weaved_fns, weaved_syms, hybrid_points, output_dir / 'hybrid',
+            _export_pinned, _run_pinned,
+        )
+        export_meta = {
+            'output_goto': '',
+            'encoding': {
+                'object_bits': object_bits,
+                'hybrid_points': len(hybrid_points),
+                'stage_timeout_sec': HYBRID_STAGE_TIMEOUT_SEC,
+            },
+            'shadow_initialization': None,
+        }
+        veribin_meta = dict(veribin_meta)
+        veribin_meta['encoding'] = 'hybrid_concrete_neighborhood'
+        veribin_meta['hybrid_points'] = o2_o3_res.get('hybrid_points')
+        hybrid_ran = True
+    elif shadow_enabled and object_bits >= 14:
         export_meta = {
             'output_goto': '',
             'encoding': {'object_bits': object_bits},
@@ -2247,17 +3591,20 @@ int {dec_fn_name}({sig_params}) {{
             object_bits=object_bits,
             timeout=case_ir['budgets']['solver_timeout_sec'],
         )
+        shadow_timeout = min(timeout_sec, 180) if shadow_enabled else timeout_sec
+        query_goto = shrink_query_goto(paired_goto, goto_instrument, output_dir / 'query_shrink')
         o2_o3_res = _run_cbmc_json(
-            paired_goto, cbmc_bin, output_dir / 'query_obligations',
-            unwind=unwind, object_bits=object_bits, timeout=timeout_sec,
-            extra_flags=_obligation_query_flags(case_ir),
+            query_goto, cbmc_bin, output_dir / 'query_obligations',
+            unwind=unwind, object_bits=object_bits, timeout=shadow_timeout,
+            extra_flags=[*_obligation_query_flags(case_ir), *_nginx_script_run_unwind_flags(case_ir)],
         )
 
     def _compile_clean_noshadow_paired(dest_dir: Path) -> Path:
         dest_dir.mkdir(parents=True, exist_ok=True)
         ns_fns, ns_syms = load_typed_goto_model(linked_goto, goto_instrument, dest_dir / 'inspect')
+        ns_veribin = apply_veribin_summaries(ns_fns, ns_syms, case_ir, plan)
         ns_cloned_fns, ns_cloned_syms, ns_wmaps = clone_dual_world_goto(
-            ns_fns, ns_syms, all_task_subtrees
+            ns_fns, ns_syms, ns_veribin['subtree']
         )
         ns_weaved_fns, ns_weaved_syms = apply_paired_weaves(
             ns_cloned_fns, ns_cloned_syms, ns_wmaps['w1'], resolved_weave_specs,
@@ -2277,14 +3624,14 @@ int {dec_fn_name}({sig_params}) {{
             ns_weaved_fns, ns_weaved_syms, ns_goto, tool_dir, dest_dir / 'export',
             enable_shadow=False, object_bits=object_bits, timeout=timeout_sec,
         )
-        return ns_goto
+        return shrink_query_goto(ns_goto, goto_instrument, dest_dir / 'shrink')
 
-    if o2_o3_res['status'] != 'completed' and bool(case_sym_cfg.get('enable_uninitialized_shadow', True)):
+    if not hybrid_ran and o2_o3_res['status'] != 'completed' and bool(case_sym_cfg.get('enable_uninitialized_shadow', True)):
         noshadow_goto = _compile_clean_noshadow_paired(output_dir / 'clean_noshadow')
         o2_o3_res = _run_cbmc_json(
             noshadow_goto, cbmc_bin, output_dir / 'query_obligations_noshadow',
             unwind=unwind, object_bits=object_bits, timeout=timeout_sec,
-            extra_flags=_obligation_query_flags(case_ir),
+            extra_flags=[*_obligation_query_flags(case_ir), *_nginx_script_run_unwind_flags(case_ir), *_noshadow_query_flags(case_ir)],
         )
         o2_o3_res['shadow_fallback'] = True
 
@@ -2292,11 +3639,11 @@ int {dec_fn_name}({sig_params}) {{
 
     unmodeled_init_props = [p for p in props if p.get('description', '').startswith('__VG_UNMODELED_INIT:')]
     unmodeled_init_reached = any(p.get('status') == 'FAILURE' for p in unmodeled_init_props)
-    if unmodeled_init_reached:
+    if unmodeled_init_reached and not hybrid_ran:
         noshadow_goto = _compile_clean_noshadow_paired(output_dir / 'clean_noshadow')
         ns_res = _run_cbmc_json(
             noshadow_goto, cbmc_bin, output_dir / 'query_obligations_noshadow',
-            extra_flags=_obligation_query_flags(case_ir),
+            extra_flags=[*_obligation_query_flags(case_ir), *_nginx_script_run_unwind_flags(case_ir), *_noshadow_query_flags(case_ir)],
             unwind=unwind, object_bits=object_bits, timeout=timeout_sec,
         )
         if ns_res['status'] == 'completed':
@@ -2316,6 +3663,7 @@ int {dec_fn_name}({sig_params}) {{
     ) or ((any(tok in p.get('property', '') for tok in ('__vg_w1_', '__vulgate_action_')))
           and '.unwind.' not in p.get('property', '')
           and not p.get('description', '').startswith('__VG_UNMODELED_INIT:')
+          and not p.get('description', '').startswith('__VG_REACH_SENSITIVE:')
           and 'vg.target.' not in p.get('description', '')))]
 
     target_w1_props = obligation_target_properties(props)
@@ -2354,13 +3702,26 @@ int {dec_fn_name}({sig_params}) {{
     })
     if o2_status == 'PROVED_IN_BOUNDED_DOMAIN' and continuation_closure_blocks_proof(plan):
         o2_status = 'UNRESOLVED'
+    neighborhood_clear = bool(hybrid_ran and o2_o3_res.get('reason') == 'hybrid_neighborhood_clear')
+    o2_status = apply_searched_point_claim(o2_status, neighborhood_clear)
+    o3_cut_status = apply_searched_point_claim(o3_cut_status, neighborhood_clear)
 
     if o3_cut_status == 'PROVED_IN_BOUNDED_DOMAIN' and plan['bypass_paths']:
         o3_global_status = 'PARTIAL_COVERAGE'
     else:
         o3_global_status = o3_cut_status
 
-    if o2_o3_res['status'] != 'completed':
+    if hybrid_ran:
+        regions = {
+            'candidate_predicates': [],
+            'queries': len(hybrid_points),
+            'regions': [{
+                'region': 'True',
+                'classification': 'UNRESOLVED',
+                'reason': 'hybrid_neighborhood_skips_impact',
+            }],
+        }
+    elif o2_o3_res['status'] != 'completed':
         regions = {
             'candidate_predicates': [],
             'queries': 0,
@@ -2400,7 +3761,7 @@ int {dec_fn_name}({sig_params}) {{
         output_dir=output_dir,
         unwind=unwind,
         timeout_sec=timeout_sec,
-        shadow_enabled=bool(case_sym_cfg.get('enable_uninitialized_shadow', True)),
+        shadow_enabled=bool(case_sym_cfg.get('enable_uninitialized_shadow', True)) and not bool(o2_o3_res.get('shadow_fallback')) and not unmodeled_init_reached,
     )
 
     from .entry_predicates import caller_return_conditions as _caller_return_conditions
@@ -2413,36 +3774,52 @@ int {dec_fn_name}({sig_params}) {{
         case_ir.get('symbolization_scope', {}).get('field_to_input_map') or {},
     )
 
+    hybrid_rows = list(o2_o3_res.get('hybrid_points') or [])
+    o2_report = {
+        'status': o2_status,
+        'scope': {
+            'kind': _verification_scope_kind(
+                case_sym_cfg.get('scope_kind'),
+                (abstract_snap or {}).get('mode'),
+            ),
+            'cut_functions': plan['selected_cut_functions'],
+            'harness_bridge_functions': harness_bridges,
+            'unwind': unwind,
+            'uninitialized_shadow_enabled': bool(case_sym_cfg.get('enable_uninitialized_shadow', True)),
+            'checked_obligations': _checked_obligation_names(driver_path),
+            'unreleased_resources': unreleased_resources,
+            'symbolization_constraints': symbolization_constraints(case_ir, abstract_snap),
+        },
+        'checked_properties': len(cont_props),
+        'counterexamples': o2_ces,
+    }
+    if o2_status == NO_HAZARD_ON_SEARCHED_POINTS:
+        o2_report['searched_neighborhood'] = searched_neighborhood_record(
+            hybrid_rows,
+            successful_assertion_names(cont_props),
+            unwind,
+        )
+    o3_report = {
+        'status': o3_global_status,
+        'cut_local_status': o3_cut_status,
+        'baseline_vulnerability_reproduced_in_model': w0_repro,
+        'bypass_paths': plan['bypass_paths'],
+        'counterexamples': o3_ces,
+    }
+    if o3_cut_status == NO_HAZARD_ON_SEARCHED_POINTS or o3_global_status == NO_HAZARD_ON_SEARCHED_POINTS:
+        o3_report['searched_neighborhood'] = searched_neighborhood_record(
+            hybrid_rows,
+            successful_assertion_names(target_w1_props),
+            unwind,
+        )
     result = {
         'status': 'COMPLETED',
+        'query_encoding': veribin_meta,
         'boundary_plan': plan,
         'caller_return_conditions': caller_returns,
         'export_metadata': export_meta,
-        'action_and_caller_continuation': {
-            'status': o2_status,
-            'scope': {
-                'kind': _verification_scope_kind(
-                    case_sym_cfg.get('scope_kind'),
-                    (abstract_snap or {}).get('mode'),
-                ),
-                'cut_functions': plan['selected_cut_functions'],
-                'harness_bridge_functions': harness_bridges,
-                'unwind': unwind,
-                'uninitialized_shadow_enabled': bool(case_sym_cfg.get('enable_uninitialized_shadow', True)),
-                'checked_obligations': _checked_obligation_names(driver_path),
-                'unreleased_resources': unreleased_resources,
-                'symbolization_constraints': symbolization_constraints(case_ir, abstract_snap),
-            },
-            'checked_properties': len(cont_props),
-            'counterexamples': o2_ces,
-        },
-        'target_vulnerability_elimination': {
-            'status': o3_global_status,
-            'cut_local_status': o3_cut_status,
-            'baseline_vulnerability_reproduced_in_model': w0_repro,
-            'bypass_paths': plan['bypass_paths'],
-            'counterexamples': o3_ces,
-        },
+        'action_and_caller_continuation': o2_report,
+        'target_vulnerability_elimination': o3_report,
         'pass_path_noninterference': {
             'status': pass_status,
             'counterexamples': pass_ces,
@@ -2560,7 +3937,7 @@ def _discover_paired_impact_regions(case_ir: dict[str, Any],
     tool_dir = cbmc_bin.parent
     goto_cc = tool_dir / 'goto-cc'
     goto_instrument = tool_dir / 'goto-instrument'
-    unwind = int(case_ir['budgets']['loop_unwind'])
+    unwind = min(int(case_ir['budgets']['loop_unwind']), VERIBIN_LOOP_UNWIND)
     timeout_sec = max(int(case_ir['budgets']['solver_timeout_sec']), 600)
     max_regions = int(case_ir['budgets']['max_impact_regions'])
 
@@ -2597,8 +3974,25 @@ def _discover_paired_impact_regions(case_ir: dict[str, Any],
                            check=True, timeout=timeout_sec, capture_output=True, text=True)
             subprocess.run([str(goto_instrument), '--add-library', str(q_base), str(q_link)],
                            check=True, timeout=timeout_sec, capture_output=True, text=True)
-            fns, syms = load_typed_goto_model(q_link, goto_instrument, qdir / 'inspect')
-            sub_fns = [k for k in world_maps['w0'] if any(f['name'] == k for f in fns)]
+            q_model = q_link
+            q_dropped = qdir / 'q_dropped.goto'
+            dropped = subprocess.run(
+                [str(goto_instrument), '--drop-unused-functions', str(q_link), str(q_dropped)],
+                timeout=timeout_sec, capture_output=True, text=True,
+            )
+            if dropped.returncode == 0 and q_dropped.is_file() and q_dropped.stat().st_size > 0:
+                q_model = q_dropped
+            q_sliced = qdir / 'q_sliced.goto'
+            sliced = subprocess.run(
+                [str(goto_instrument), '--reachability-slice', '--slice-global-inits',
+                 str(q_model), str(q_sliced)],
+                timeout=timeout_sec, capture_output=True, text=True,
+            )
+            if sliced.returncode == 0 and q_sliced.is_file() and q_sliced.stat().st_size > 0:
+                q_model = q_sliced
+            fns, syms = load_typed_goto_model(q_model, goto_instrument, qdir / 'inspect')
+            impact_veribin = apply_veribin_summaries(fns, syms, case_ir, plan or {})
+            sub_fns = [name for name in impact_veribin['subtree'] if any(f['name'] == name for f in fns)]
             cfns, csyms, wmaps = clone_dual_world_goto(fns, syms, sub_fns)
             wfns, wsyms = apply_paired_weaves(
                 cfns, csyms, wmaps['w1'], resolved_weave_specs,
@@ -2616,12 +4010,18 @@ def _discover_paired_impact_regions(case_ir: dict[str, Any],
                             ins['guard'] = _rewrite_irep_symbols(ins['guard'], wmaps[wk])
             q_paired = qdir / 'q_paired.goto'
             finalize_and_export_goto(wfns, wsyms, q_paired, tool_dir, qdir / 'export', enable_shadow=False, object_bits=object_bits, timeout=timeout_sec)
+            impact_bits = 8 if object_bits <= 8 else 11 if object_bits <= 11 else 12
             cbmc_res = _run_cbmc_json(
-                q_paired, cbmc_bin, qdir / 'solve', unwind=unwind, object_bits=object_bits, timeout=timeout_sec,
-                extra_flags=_cbmc_entry_flags('__vg_impact_harness'),
+                q_paired, cbmc_bin, qdir / 'solve',
+                unwind=unwind, object_bits=impact_bits, timeout=min(int(timeout_sec), 180),
+                extra_flags=[*_cbmc_entry_flags('__vg_impact_harness'), *_nginx_script_run_unwind_flags(case_ir), *_noshadow_query_flags(case_ir)],
+                memory_bytes=6 * 1024 * 1024 * 1024,
             )
         except (subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError):
             return {'status': 'unresolved', 'witness': {}}
+        finally:
+            shutil.rmtree(qdir, ignore_errors=True)
+            gc.collect()
         if cbmc_res['status'] != 'completed' or cbmc_res['unwind_failures']:
             return {'status': 'unresolved', 'witness': {}}
         return classify_impact_query_result(cbmc_res['properties'])
@@ -2635,7 +4035,17 @@ def _discover_paired_impact_regions(case_ir: dict[str, Any],
             leaves.append({'region': reg, 'classification': 'UNREACHABLE'})
             continue
         if r_reach['status'] != 'sat':
-            leaves.append({'region': reg, 'classification': 'UNRESOLVED'})
+            split_pred = None
+            if len(leaves) + len(pending) + 2 <= max_regions:
+                for cand in cand_preds:
+                    if cand not in used:
+                        split_pred = cand
+                        break
+            if split_pred:
+                pending.append((f'({reg}) and ({split_pred})', [*used, split_pred]))
+                pending.append((f'({reg}) and (not ({split_pred}))', [*used, split_pred]))
+            else:
+                leaves.append({'region': reg, 'classification': 'UNRESOLVED'})
             continue
         r_diff = run_region_query(reg, 'diff')
         if r_diff['status'] == 'unsat':

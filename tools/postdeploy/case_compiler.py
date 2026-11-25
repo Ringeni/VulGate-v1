@@ -481,12 +481,13 @@ def bind_structured_map_read(map_name: str, map_def: dict[str, Any], read: dict[
                              slot_cursor: int) -> tuple[dict[str, dict[str, Any]], dict[str, Any], int]:
     _key_fields, value_fields = map_word_layout(map_name, map_def)
     into = read.get('into') or read.get('into_slot')
-    if not isinstance(into, str) or not into:
+    present_only = not (isinstance(into, str) and into) and isinstance(read.get('present_into'), str) and bool(read['present_into'])
+    if not present_only and (not isinstance(into, str) or not into):
         raise ValueError(f'map read of {map_name} needs into or into_slot')
     if not value_fields:
         val_slot = int(read.get('slot', slot_cursor))
         slot_cursor = max(slot_cursor, val_slot + 1)
-        fields = {into: {'source': 'slot', 'index': val_slot}}
+        fields: dict[str, dict[str, Any]] = {} if present_only else {str(into): {'source': 'slot', 'index': val_slot}}
         ref: dict[str, Any] = {
             'map': read['map'],
             'slot': val_slot,
@@ -508,7 +509,8 @@ def bind_structured_map_read(map_name: str, map_def: dict[str, Any], read: dict[
     for offset, field in enumerate(value_fields):
         slot = base + offset
         slot_cursor = max(slot_cursor, slot + 1)
-        fields[f'{into}.{field}'] = {'source': 'slot', 'index': slot}
+        if not present_only:
+            fields[f'{into}.{field}'] = {'source': 'slot', 'index': slot}
         word_slots.append(slot)
     ref = {
         'map': read['map'],
@@ -568,7 +570,60 @@ def compile_case(vuln_spec: dict[str, Any],
             'map': obs['map'],
             'operation': obs.get('operation', 'set'),
         }
-        if 'callsite' in obs:
+        if 'dsl_operations' in obs:
+            obs_entry['dsl_mount_id'] = obs.get('dsl_mount_id', obs['id'])
+            obs_entry['dsl_operations'] = json.loads(json.dumps(obs['dsl_operations']))
+            obs_entry['local_names'] = list(obs.get('local_names', []))
+            obs_entry['arg_indices'] = list(obs.get('arg_indices', []))
+            if obs.get('function'):
+                obs_entry['function'] = obs['function']
+            if 'offset' in obs:
+                obs_entry['offset'] = int(obs['offset'])
+            elif 'dsl_callsite' in obs:
+                from runtime.dsl import dwarf_local as _dwarf_local
+                from runtime.dsl import x86 as _dsl_x86
+                cs = dict(obs['dsl_callsite'])
+                obs_entry['dsl_callsite'] = cs
+                resolved_cs_off: int | None = None
+                try:
+                    resolved_cs_off = int(_dsl_x86.resolve_callsite(
+                        mod_path, cs['caller'], cs['callee'], cs.get('line'), cs.get('file'),
+                    ))
+                except Exception:
+                    resolved_cs_off = symbol_tables[mod_name].get(str(cs.get('caller') or ''))
+                if resolved_cs_off is None:
+                    raise ValueError(f'observer {obs["id"]} callsite {cs.get("caller")}->{cs.get("callee")} unresolved in {mod_name}')
+                obs_entry['offset'] = resolved_cs_off
+                recipes: dict[str, Any] = {}
+                for l_idx, lname in enumerate(obs_entry['local_names']):
+                    try:
+                        recipes[lname] = _dwarf_local.resolve_local(mod_path, str(cs['caller']), lname, resolved_cs_off)
+                    except Exception:
+                        recipes[lname] = {'kind': 'register', 'reg': f'r{8 + l_idx}'}
+                if recipes:
+                    obs_entry['local_recipes'] = recipes
+            elif 'dsl_line' in obs:
+                from runtime.dsl import x86 as _dsl_x86
+                ln = dict(obs['dsl_line'])
+                obs_entry['dsl_line'] = ln
+                try:
+                    obs_entry['offset'] = int(_dsl_x86.resolve_line(mod_path, str(ln['file']), int(ln['line'])))
+                except Exception as exc:
+                    fn_fallback = str(obs.get('function') or '')
+                    if fn_fallback and fn_fallback in symbol_tables[mod_name]:
+                        obs_entry['offset'] = symbol_tables[mod_name][fn_fallback]
+                    else:
+                        raise ValueError(f'observer {obs["id"]} line unresolved in {mod_name}: {exc}') from exc
+            else:
+                fn = obs.get('function')
+                if not fn:
+                    raise ValueError(f'observer {obs.get("id")} needs a function')
+                if fn in ambiguous_tables[mod_name]:
+                    raise ValueError(f'ambiguous observer function symbol {fn} in {mod_name}: {ambiguous_tables[mod_name][fn]}')
+                if fn not in symbol_tables[mod_name]:
+                    raise ValueError(f'missing observer function symbol {fn} in {mod_name}')
+                obs_entry['offset'] = symbol_tables[mod_name][fn]
+        elif 'callsite' in obs:
             cs = obs['callsite']
             bound = bind_callsite(
                 mod_path, cs['caller'], cs['callee'], int(cs['source_line']),
@@ -811,6 +866,12 @@ def compile_case(vuln_spec: dict[str, Any],
             'resolved_action': raw_action,
             'step_limit': int(g.get('step_limit', 4096)),
         }
+        if g.get('caller'):
+            guard_ir['caller'] = g['caller']
+        if g.get('dsl_ast'):
+            guard_ir['dsl_ast'] = json.loads(json.dumps(g['dsl_ast']))
+        if g.get('dsl_loops'):
+            guard_ir['dsl_loops'] = json.loads(json.dumps(g['dsl_loops']))
         if dsl_patch:
             guard_ir.update({
                 'rule_source': 'dsl',
@@ -818,6 +879,59 @@ def compile_case(vuln_spec: dict[str, Any],
                 'dsl_patch_sha256': dsl_patch.get('sha256'),
             })
         compiled_guards_ir.append(guard_ir)
+
+    if dsl_patch and dsl_patch.get('path') and Path(dsl_patch['path']).is_file():
+        from runtime.dsl import parser as _dsl_parser
+        from runtime.dsl import vm as _dsl_vm
+        vg_spec = _dsl_parser.load(Path(dsl_patch['path']))
+        dsl_globals: dict[str, int] = {}
+        synth_cursor = 0
+        for mount in vg_spec.mounts:
+            m_mod = mount.module if mount.module in symbol_tables else exe_path.name
+            for gname in re.findall(r'global\("([^"]+)"\)', mount.body):
+                if gname in dsl_globals:
+                    continue
+                found_off = symbol_tables.get(m_mod, {}).get(gname)
+                if found_off is None:
+                    for tbl in symbol_tables.values():
+                        if gname in tbl:
+                            found_off = tbl[gname]
+                            break
+                if found_off is not None:
+                    dsl_globals[gname] = 0x40000000 + int(found_off)
+                else:
+                    synth_cursor += 1
+                    dsl_globals[gname] = 0x50000000 + synth_cursor * 0x10000
+            local_order: list[str] = []
+            for lname in re.findall(r'local\("([^"]+)"\)', mount.body):
+                if lname not in local_order:
+                    local_order.append(lname)
+            for l_slot, lname in enumerate(local_order):
+                mount.local_recipes.setdefault(lname, {'kind': 'register', 'reg': f'r{l_slot}'})
+        compiled_vg = _dsl_vm.compile_patch(vg_spec, dsl_globals)
+        obs_cursor = 0
+        guard_cursor = 0
+        for m_idx, vm_mount in enumerate(compiled_vg.mounts):
+            safe_mid = re.sub(r'[^A-Za-z0-9_.-]', '_', vm_mount.id.rsplit('/', 1)[-1])
+            dsl_bin = deploy_dir / f'dsl-vm-{m_idx}-{safe_mid}.bin'
+            dsl_bin.write_bytes(vm_mount.code)
+            meta = {
+                'dsl_vm_rule_path': str(dsl_bin),
+                'dsl_vm_bytecode_sha256': hashlib.sha256(vm_mount.code).hexdigest(),
+                'dsl_vm_bytecode_instructions': len(vm_mount.code) // 8,
+                'dsl_vm_globals': dict(compiled_vg.globals_),
+                'dsl_vm_maps': list(compiled_vg.maps),
+                'dsl_vm_locals': list(vm_mount.locals),
+                'dsl_mount_id': vm_mount.id,
+            }
+            if vm_mount.nature == 'read_point':
+                if obs_cursor < len(observers_manifest):
+                    observers_manifest[obs_cursor].update(meta)
+                obs_cursor += 1
+            else:
+                if guard_cursor < len(compiled_guards_ir):
+                    compiled_guards_ir[guard_cursor].update(meta)
+                guard_cursor += 1
 
     source_root = ((app_profile.get('builds') or {}).get('baseline') or {}).get('source_dir')
     action_catalog_extraction = attest_catalog(

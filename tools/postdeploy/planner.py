@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import deque
 import json
 from pathlib import Path
+import re
 from typing import Any
 
 from tools.verification.shadow import symbol_name, typ
@@ -27,20 +28,24 @@ def load_typed_goto_model(goto_binary: Path, goto_instrument: Path, work_dir: Pa
     work_dir.mkdir(parents=True, exist_ok=True)
     fn_json = work_dir / 'raw-functions.json'
     sym_json = work_dir / 'raw-symbols.json'
-    with fn_json.open('wb') as out, (work_dir / 'raw-functions.err').open('wb') as err:
-        subprocess.run([str(goto_instrument), '--show-goto-functions-raw', '--json-ui', str(goto_binary)],
-                       stdout=out, stderr=err, timeout=timeout, check=True)
-    with sym_json.open('wb') as out, (work_dir / 'raw-symbols.err').open('wb') as err:
-        subprocess.run([str(goto_instrument), '--show-symbol-table-raw', '--json-ui', str(goto_binary)],
-                       stdout=out, stderr=err, timeout=timeout, check=True)
-    fn_messages: list[dict[str, Any]] = []
-    bodies = list(stream_functions(fn_json, messages=fn_messages))
-    for group in fn_messages:
-        if 'functions' in group:
-            group['functions'] = bodies
-    sym_messages = strict_loads(sym_json.read_text(encoding='utf-8'))
-    functions, symbols, _ = inspection_model(fn_messages, sym_messages, mode=FULL)
-    return functions, symbols
+    try:
+        with fn_json.open('wb') as out, (work_dir / 'raw-functions.err').open('wb') as err:
+            subprocess.run([str(goto_instrument), '--show-goto-functions-raw', '--json-ui', str(goto_binary)],
+                           stdout=out, stderr=err, timeout=timeout, check=True)
+        with sym_json.open('wb') as out, (work_dir / 'raw-symbols.err').open('wb') as err:
+            subprocess.run([str(goto_instrument), '--show-symbol-table-raw', '--json-ui', str(goto_binary)],
+                           stdout=out, stderr=err, timeout=timeout, check=True)
+        fn_messages: list[dict[str, Any]] = []
+        bodies = list(stream_functions(fn_json, messages=fn_messages))
+        for group in fn_messages:
+            if 'functions' in group:
+                group['functions'] = bodies
+        sym_messages = strict_loads(sym_json.read_text(encoding='utf-8'))
+        functions, symbols, _ = inspection_model(fn_messages, sym_messages, mode=FULL)
+        return functions, symbols
+    finally:
+        fn_json.unlink(missing_ok=True)
+        sym_json.unlink(missing_ok=True)
 
 
 def _type_shape(value: Any) -> tuple[Any, ...] | None:
@@ -929,6 +934,28 @@ def continuation_closure_blocks_proof(plan: dict[str, Any]) -> bool:
     return False
 
 
+def _module_phase_root(name: str) -> bool:
+    base = str(name).split('::')[-1]
+    if base in {
+        'ngx_http_output_filter',
+        'ngx_http_script_run',
+        'ngx_http_upstream_init_request',
+        'ngx_http_map_uri_to_path',
+        'ngx_http_copy_filter',
+        'ap_pass_brigade',
+        'rfc1867_post_handler',
+        'BrotliDecoderDecompressStream',
+    }:
+        return True
+    if re.fullmatch(r'ngx_http_.+_(phase|handler)', base):
+        return True
+    if base.startswith('ap_run_'):
+        return True
+    if base.startswith('ngx_http_') and base.endswith('_filter'):
+        return True
+    return False
+
+
 def limit_claim_to_activated_path(plan: dict[str, Any],
                                   continuation: str,
                                   target_global: str,
@@ -1152,6 +1179,9 @@ def extract_patch_footprint(case_ir: dict[str, Any],
         function = str(guard.get('function') or '')
         if function and function not in guard_functions:
             guard_functions.append(function)
+        caller_fn = str(guard.get('caller') or '')
+        if caller_fn and caller_fn not in guard_functions:
+            guard_functions.append(caller_fn)
         if guard.get('id'):
             hook_ids.append(str(guard['id']))
         reads = [
@@ -1289,6 +1319,8 @@ def plan_verification_boundaries(case_ir: dict[str, Any],
     for obs in case_ir.get('observer_specs', []):
         if 'callsite' in obs:
             name = obs['callsite']['caller']
+        elif 'dsl_callsite' in obs and isinstance(obs['dsl_callsite'], dict):
+            name = obs['dsl_callsite'].get('caller')
         elif 'function' in obs:
             name = obs['function']
         elif isinstance(obs.get('site'), dict):
@@ -1392,8 +1424,12 @@ def plan_verification_boundaries(case_ir: dict[str, Any],
             selected_cuts = sorted(per_guard_cuts)
 
     operation_begin_absent = bool(declared_roots) and not root_reach
-    operation_begin_miss = operation_begin_absent or (
-        bool(root_reach) and not any(name in root_reach for name in selected_cuts)
+    phase_cuts = [name for name in selected_cuts if _module_phase_root(name)]
+    entry_anchor_kind = 'module_phase_root' if operation_begin_absent and phase_cuts else ''
+    operation_begin_miss = False if entry_anchor_kind else (
+        operation_begin_absent or (
+            bool(root_reach) and not any(name in root_reach for name in selected_cuts)
+        )
     )
     end_irs = [ir_name for name in end_names for ir_name in resolve_ir_function_names(icfg, name)]
     covered_by_cuts: set[str] = set()
@@ -1554,6 +1590,7 @@ def plan_verification_boundaries(case_ir: dict[str, Any],
         'operation_begin': begin_names,
         'operation_end': end_names,
         'operation_begin_absent': operation_begin_absent,
+        'entry_anchor_kind': entry_anchor_kind,
         'operation_begin_miss': operation_begin_miss,
         'operation_end_outside_cut': operation_end_outside_cut,
         'patch_footprint': footprint,

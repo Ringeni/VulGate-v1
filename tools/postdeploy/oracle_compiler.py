@@ -249,6 +249,9 @@ def observer_function_name(observer: dict[str, Any]) -> str | None:
     callsite = observer.get('callsite') if isinstance(observer.get('callsite'), dict) else {}
     if callsite.get('caller'):
         return str(callsite['caller'])
+    dsl_cs = observer.get('dsl_callsite') if isinstance(observer.get('dsl_callsite'), dict) else {}
+    if dsl_cs.get('caller'):
+        return str(dsl_cs['caller'])
     if observer.get('function'):
         return str(observer['function'])
     site = observer.get('site') if isinstance(observer.get('site'), dict) else {}

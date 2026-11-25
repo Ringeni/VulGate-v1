@@ -78,7 +78,7 @@ def build(name):
         binary = source / 'httpd'
     if not (source / 'Makefile').exists(): run(command, 'configure', env)
     if previous and binary.exists(): binary.unlink()  # Only this generated build artifact.
-    run(['make', '-j4'], 'make', env)
+    run(['make', '-j1' if name.startswith('httpd') else '-j4'], 'make', env)
     executable = output / ('nginx' if name.startswith('nginx') else 'httpd')
     shutil.copy2(binary, executable)
     result = {'name': name, 'source': str(source), 'executable': str(executable), 'trace_runtime_sha256': trace_hash,

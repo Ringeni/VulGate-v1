@@ -237,3 +237,134 @@ def test_every_main_chain_patch_derives_a_guard_model() -> None:
         assert derived['guards'], path.name
         for guard in derived['guards']:
             assert guard['action_id'] in derived['actions'], (path.name, guard['id'])
+
+
+def test_read_point_loops_inline_args_and_compound_selectors(tmp_path: Path) -> None:
+    from tools.postdeploy.planner import extract_patch_footprint
+
+    b111497 = dsl_front.derive_patch_spec(DSL_PATCHES / 'CVE-2026-111497.vg')
+    assert len(b111497['observers']) == 1
+    obs = b111497['observers'][0]
+    assert obs['id'] == 'before_refill'
+    assert obs['function'] == 'BrotliDecoderDecompressStream'
+    assert obs['dsl_callsite']['caller'] == 'BrotliDecoderDecompressStream'
+    assert obs['dsl_callsite']['callee'] == 'WriteRingBuffer'
+    assert obs['local_names'] == ['available_in']
+    assert obs['arg_indices'] == [0]
+    fp = extract_patch_footprint({
+        'observer_specs': b111497['observers'],
+        'guards': b111497['guards'],
+        'defect_anchors': {},
+    })
+    assert 'BrotliDecoderDecompressStream' in fp['slice_functions']
+
+    fine_93479 = dsl_front.derive_patch_spec(ROOT / 'runtime' / 'dsl' / 'patches_fine' / 'CVE-2026-93479.vg')
+    g_fine = fine_93479['guards'][0]
+    assert 'arg1' in g_fine['selectors']
+    assert '((end - pos) < arg1)' in g_fine['expression']
+
+    loop_demo = dsl_front.derive_patch_spec(ROOT / 'tests' / 'workloads' / 'dsl' / 'loop_demo.vg')
+    assert loop_demo['observers'][0]['dsl_operations'][0]['kind'] == 'loop'
+    assert loop_demo['guards'][0]['map_reads'] == [
+        {'map': 'limits', 'present_into': 'present', 'key': {'constant': 3}},
+    ]
+
+    map_demo = dsl_front.derive_patch_spec(ROOT / 'tests' / 'workloads' / 'dsl' / 'map_demo.vg')
+    assert map_demo['observers'][0]['dsl_operations'][1]['key'] == {'kind': 'const', 'value': 0}
+    assert 'arg1' in map_demo['guards'][0]['selectors']
+
+    compound_vg = tmp_path / 'compound.vg'
+    compound_vg.write_text(
+        'map seen: { capacity: 8 }\n'
+        'action DENY: { return_type: int\n return: -1 }\n'
+        'mount check_compound: {\n'
+        '    location: symbol="target_fn", args=[pointer, uint64], return=int\n'
+        '    nature: intercept\n'
+        '    behavior: {\n'
+        '        for (i = 0; i < 3; i++) { map["seen"][i] = i + 10; }\n'
+        '        value["end"] = vg_read_u64(arg0 + 16);\n'
+        '        value["pos"] = vg_read_u64(arg0 + 8);\n'
+        '        value["span"] = value["end"] - value["pos"];\n'
+        '        value["hit"] = map_get("seen", 2);\n'
+        '        if (value["span"] < arg1 && value["hit"] == 12) { return block("DENY"); }\n'
+        '    }\n'
+        '}\n',
+        encoding='utf-8',
+    )
+    comp_spec = dsl_front.derive_patch_spec(compound_vg)
+    cg = comp_spec['guards'][0]
+    assert cg['dsl_loops'][0]['bound'] == 3
+    assert 'span' not in cg['selectors']
+    assert '((end - pos) < arg1)' in cg['expression']
+    assert cg['map_reads'][0]['on_missing'] == 'pass'
+
+
+def test_cbmc_dsl_vm_bytecode_equivalence(tmp_path: Path) -> None:
+    from tools.postdeploy.obligations import (
+        verify_dsl_observer_bytecode_equivalence,
+        verify_vm_bytecode_equivalence,
+    )
+
+    cbmc = Path(os.environ.get('VULGATE_CBMC', '/opt/vulgate-cbmc/toolchain-bin/cbmc'))
+    if not cbmc.is_file():
+        pytest.skip('CBMC toolchain is not available')
+
+    vuln_111497, yaml_111497, prof_111497 = _load_specs('CVE-2026-111497')
+    ir_111497 = compile_case(
+        vuln_111497,
+        dsl_front.derive_patch_spec(DSL_PATCHES / 'CVE-2026-111497.vg', yaml_111497),
+        prof_111497,
+        tmp_path / 'ir_111497',
+    )
+    obs_eq = verify_dsl_observer_bytecode_equivalence(
+        ir_111497['observers'][0], cbmc, tmp_path / 'eq_obs_111497',
+    )
+    assert obs_eq['status'] == 'PROVED'
+    grd_eq = verify_vm_bytecode_equivalence(
+        ir_111497['guards'][0], cbmc, tmp_path / 'eq_grd_111497',
+    )
+    assert grd_eq['status'] == 'PROVED'
+    assert grd_eq['dsl_vm_proved'] is True
+
+    vuln_15176, yaml_15176, prof_15176 = _load_specs('CVE-2026-15176')
+    ir_15176 = compile_case(
+        vuln_15176,
+        dsl_front.derive_patch_spec(DSL_PATCHES / 'CVE-2026-15176.vg', yaml_15176),
+        prof_15176,
+        tmp_path / 'ir_15176',
+    )
+    eq_15176 = verify_vm_bytecode_equivalence(
+        ir_15176['guards'][0], cbmc, tmp_path / 'eq_grd_15176',
+    )
+    assert eq_15176['status'] == 'PROVED'
+    assert eq_15176['dsl_vm_proved'] is True
+    assert eq_15176['dsl_vm_equivalence']['status'] == 'PROVED'
+
+    vuln_97205, yaml_97205, prof_97205 = _load_specs('CVE-2026-97205')
+    ir_97205 = compile_case(
+        vuln_97205,
+        dsl_front.derive_patch_spec(DSL_PATCHES / 'CVE-2026-97205.vg', yaml_97205),
+        prof_97205,
+        tmp_path / 'ir_97205',
+    )
+    eq_97205 = verify_vm_bytecode_equivalence(
+        ir_97205['guards'][0], cbmc, tmp_path / 'eq_grd_97205',
+    )
+    assert eq_97205['status'] == 'PROVED'
+    assert eq_97205['dsl_vm_proved'] is True
+    assert eq_97205['dsl_vm_equivalence']['status'] == 'PROVED'
+
+    corrupted_guard = dict(ir_97205['guards'][0])
+    bad_bin = tmp_path / 'bad_97205.bin'
+    raw_insns = bytearray(Path(corrupted_guard['dsl_vm_rule_path']).read_bytes())
+    raw_insns[-16] = 0xB7
+    raw_insns[-12:-8] = (0).to_bytes(4, 'little', signed=True)
+    bad_bin.write_bytes(bytes(raw_insns))
+    corrupted_guard['dsl_vm_rule_path'] = str(bad_bin)
+    eq_bad = verify_vm_bytecode_equivalence(
+        corrupted_guard, cbmc, tmp_path / 'eq_grd_bad',
+    )
+    assert eq_bad['status'] == 'VIOLATED'
+    assert eq_bad['dsl_vm_proved'] is False
+    assert eq_bad['dsl_vm_equivalence']['status'] == 'VIOLATED'
+

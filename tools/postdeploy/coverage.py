@@ -9,24 +9,47 @@ def edges(trace):
     return set(zip([-1, *trace], trace))
 
 
-def summarize(pairs):
-    baseline_hits, patched_hits, lost, gained, gained_error = Counter(), Counter(), Counter(), Counter(), Counter()
-    paths, incomplete = [], 0
-    for case_id, baseline, patched in pairs:
+class PairCoverage:
+    def __init__(self) -> None:
+        self.baseline_hits: Counter = Counter()
+        self.patched_hits: Counter = Counter()
+        self.lost: Counter = Counter()
+        self.gained: Counter = Counter()
+        self.gained_error: Counter = Counter()
+        self.paths: list[dict] = []
+        self.incomplete = 0
+
+    def add(self, case_id, baseline, patched) -> None:
         if not baseline.get('trace_complete') or not patched.get('trace_complete'):
-            incomplete += 1
-            continue
+            self.incomplete += 1
+            return
         b, t = edges(baseline['trace']), edges(patched['trace'])
-        baseline_hits.update(b)
-        patched_hits.update(t)
-        lost.update(b - t)
-        gained.update(t - b)
+        self.baseline_hits.update(b)
+        self.patched_hits.update(t)
+        self.lost.update(b - t)
+        self.gained.update(t - b)
         if patched.get('error_fallback'):
-            gained_error.update(t - b)
-        paths.append({'case_id': case_id, 'same_sequence': baseline['trace'] == patched['trace'],
-                      'lost_edges': len(b - t), 'gained_edges': len(t - b),
-                      'baseline_signature': hashlib.sha256(json.dumps(baseline['trace']).encode()).hexdigest(),
-                      'patched_signature': hashlib.sha256(json.dumps(patched['trace']).encode()).hexdigest()})
+            self.gained_error.update(t - b)
+        self.paths.append({'case_id': case_id, 'same_sequence': baseline['trace'] == patched['trace'],
+                           'lost_edges': len(b - t), 'gained_edges': len(t - b),
+                           'baseline_signature': hashlib.sha256(json.dumps(baseline['trace']).encode()).hexdigest(),
+                           'patched_signature': hashlib.sha256(json.dumps(patched['trace']).encode()).hexdigest()})
+
+    def finish(self) -> dict:
+        baseline_hits, patched_hits = self.baseline_hits, self.patched_hits
+        lost, gained, gained_error = self.lost, self.gained, self.gained_error
+        paths, incomplete = self.paths, self.incomplete
+        return _finish_coverage(baseline_hits, patched_hits, lost, gained, gained_error, paths, incomplete)
+
+
+def summarize(pairs):
+    coverage = PairCoverage()
+    for case_id, baseline, patched in pairs:
+        coverage.add(case_id, baseline, patched)
+    return coverage.finish()
+
+
+def _finish_coverage(baseline_hits, patched_hits, lost, gained, gained_error, paths, incomplete):
     tests = []
     for edge in sorted(set(baseline_hits) | set(patched_hits)):
         a, b = lost[edge], gained[edge]

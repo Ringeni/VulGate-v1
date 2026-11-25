@@ -44,6 +44,231 @@ def shared_readonly_symbol(name: str) -> bool:
     return name.split('::')[-1] in READONLY_READS
 
 
+VERIBIN_LOOP_UNWIND = 2
+
+_HYBRID_ENGINE_BASES = {
+    'ngx_http_script_run',
+    'ngx_regex_exec',
+    'ngx_http_rewrite_handler',
+    'ngx_http_core_content_phase',
+    'ngx_http_map_find',
+}
+
+_VERIBIN_DRIVER_FILES = {
+    'auto_synthesized_driver.c',
+    'local_driver.c',
+    'driver_region.c',
+    'vg_paired_helpers.c',
+}
+
+
+def _base_name(name: str, symbols: dict[str, Any]) -> str:
+    base = str(symbols.get(name, {}).get('baseName') or '')
+    if base:
+        return base
+    return name.split('::')[-1]
+
+
+def _location_file(name: str, symbols: dict[str, Any]) -> str:
+    return str((symbols.get(name, {}).get('location') or {}).get('file') or '')
+
+
+def _veribin_footprint_bases(case_ir: dict[str, Any], plan: dict[str, Any]) -> set[str]:
+    bases: set[str] = set()
+    footprint = (plan or {}).get('patch_footprint') or {}
+    for name in footprint.get('slice_functions') or []:
+        text = str(name or '')
+        if text:
+            bases.add(text.split('::')[-1])
+    for guard in (case_ir or {}).get('guards') or []:
+        text = str(guard.get('function') or '')
+        if text:
+            bases.add(text.split('::')[-1])
+    anchors = (case_ir or {}).get('defect_anchors') or {}
+    for key in ('sink_site', 'root_cause_site'):
+        text = str((anchors.get(key) or {}).get('function') or '')
+        if text:
+            bases.add(text.split('::')[-1])
+    return bases
+
+
+def veribin_keep_names(functions: list[dict[str, Any]],
+                       symbols: dict[str, Any],
+                       case_ir: dict[str, Any],
+                       plan: dict[str, Any]) -> set[str]:
+    bases = _veribin_footprint_bases(case_ir, plan)
+    keep: set[str] = set()
+    for fn in functions:
+        name = str(fn.get('name') or '')
+        if not name:
+            continue
+        base = _base_name(name, symbols)
+        loc = _location_file(name, symbols).replace('\\', '/')
+        leaf = loc.rsplit('/', 1)[-1]
+        if (name.startswith(('__CPROVER_', '__vulgate_', '__vg_'))
+                or base.startswith(('__CPROVER_', '__vulgate_', '__vg_'))
+                or loc.startswith('<builtin-library-')
+                or leaf in _VERIBIN_DRIVER_FILES
+                or shared_allocator_symbol(name)
+                or shared_readonly_symbol(name)
+                or base in bases
+                or name in bases):
+            keep.add(name)
+    return keep
+
+
+def _direct_callees(fn: dict[str, Any]) -> list[str]:
+    found: list[str] = []
+    for insn in fn.get('instructions') or []:
+        if insn.get('instructionId') != 'FUNCTION_CALL':
+            continue
+        ops = (insn.get('code') or {}).get('sub') or []
+        if len(ops) < 2 or ops[1].get('id') != 'symbol':
+            continue
+        callee = symbol_name(ops[1])
+        if callee:
+            found.append(callee)
+    return found
+
+
+def veribin_query_subtree(functions: list[dict[str, Any]],
+                          keep: set[str]) -> list[str]:
+    by_name = {str(fn.get('name') or ''): fn for fn in functions}
+    seen: set[str] = set()
+    stack: list[str] = []
+    for root in ('__vg_run_world_0', '__vg_run_world_1', '__vg_impact_harness', '__vg_verify_obligations'):
+        fn = by_name.get(root)
+        if fn is not None:
+            stack.extend(_direct_callees(fn))
+    while stack:
+        name = stack.pop()
+        if name in seen or name not in keep or name not in by_name:
+            continue
+        if name.startswith(('__CPROVER_', '__vulgate_', '__vg_verify', '__vg_run_world', '__vg_impact')):
+            continue
+        seen.add(name)
+        stack.extend(_direct_callees(by_name[name]))
+    return sorted(seen)
+
+
+def _collapse_indirect_calls(fn: dict[str, Any]) -> int:
+    count = 0
+    for insn in fn.get('instructions') or []:
+        if insn.get('instructionId') != 'FUNCTION_CALL':
+            continue
+        ops = (insn.get('code') or {}).get('sub') or []
+        if len(ops) < 2 or ops[1].get('id') == 'symbol':
+            continue
+        lhs = ops[0]
+        if not isinstance(lhs, dict) or lhs.get('id') in (None, 'nil'):
+            insn['instructionId'] = 'SKIP'
+            insn['code'] = {
+                'id': 'code',
+                'namedSub': {'statement': {'id': 'skip'}, 'type': {'id': 'empty'}},
+            }
+            insn.pop('targets', None)
+            count += 1
+            continue
+        lhs_type = (lhs.get('namedSub') or {}).get('type') or {
+            'id': 'unsignedbv',
+            'namedSub': {'width': {'id': '64'}},
+        }
+        nondet = {
+            'id': 'side_effect',
+            'namedSub': {
+                'statement': {'id': 'nondet'},
+                'type': deepcopy(lhs_type),
+            },
+        }
+        insn['instructionId'] = 'ASSIGN'
+        insn['code'] = irep_code('assign', [deepcopy(lhs), nondet])
+        insn.pop('targets', None)
+        count += 1
+    return count
+
+
+def _summarize_function(fn: dict[str, Any]) -> bool:
+    if not fn.get('isBodyAvailable'):
+        return False
+    fn['isBodyAvailable'] = False
+    fn['instructions'] = []
+    return True
+
+
+def _constant_return_body(fn: dict[str, Any], symbols: dict[str, Any]) -> bool:
+    donor = None
+    end = None
+    for insn in fn.get('instructions') or []:
+        if donor is None:
+            donor = insn
+        if insn.get('instructionId') == 'END_FUNCTION':
+            end = deepcopy(insn)
+    if donor is None or end is None:
+        return False
+    ret = ((symbols.get(fn['name']) or {}).get('type') or {}).get('namedSub', {}).get('return_type')
+    body: list[dict[str, Any]] = []
+    if isinstance(ret, dict) and ret.get('id') not in (None, 'empty', 'void'):
+        zero = {'id': 'constant', 'namedSub': {'type': deepcopy(ret), 'value': {'id': '0'}}}
+        set_ret = {
+            'instructionId': 'SET_RETURN_VALUE',
+            'locationNumber': 0,
+            'code': irep_code('return', [zero]),
+        }
+        copy_location(set_ret, donor, mode=FULL)
+        body.append(set_ret)
+    end['locationNumber'] = len(body)
+    end.pop('targets', None)
+    body.append(end)
+    fn['instructions'] = body
+    fn['isBodyAvailable'] = True
+    return True
+
+
+def concretize_foreign_engines(functions: list[dict[str, Any]],
+                               symbols: dict[str, Any],
+                               case_ir: dict[str, Any],
+                               plan: dict[str, Any]) -> list[str]:
+    footprint = _veribin_footprint_bases(case_ir, plan)
+    changed: list[str] = []
+    for fn in functions:
+        base = _base_name(str(fn.get('name') or ''), symbols)
+        if base not in _HYBRID_ENGINE_BASES or base in footprint:
+            continue
+        if len(fn.get('instructions') or []) <= 24:
+            continue
+        if _constant_return_body(fn, symbols):
+            changed.append(str(fn.get('name') or base))
+    return changed
+
+
+def apply_veribin_summaries(functions: list[dict[str, Any]],
+                            symbols: dict[str, Any],
+                            case_ir: dict[str, Any],
+                            plan: dict[str, Any]) -> dict[str, Any]:
+    engines = concretize_foreign_engines(functions, symbols, case_ir, plan)
+    keep = veribin_keep_names(functions, symbols, case_ir, plan)
+    summarized = 0
+    collapsed = 0
+    for fn in functions:
+        name = str(fn.get('name') or '')
+        if name in keep:
+            collapsed += _collapse_indirect_calls(fn)
+            continue
+        if _summarize_function(fn):
+            summarized += 1
+    subtree = veribin_query_subtree(functions, keep)
+    return {
+        'encoding': 'veribin_uninterpreted_callees',
+        'loop_unwind': VERIBIN_LOOP_UNWIND,
+        'kept': len(keep),
+        'summarized': summarized,
+        'indirect_calls_collapsed': collapsed,
+        'engines_concretized': engines,
+        'subtree': subtree,
+        'subtree_size': len(subtree),
+    }
+
+
 def shared_allocator_symbol(name: str) -> bool:
     base = name.split('::')[-1]
     if base.startswith(('__vg_alloc_', '__vg_ngx_', '__vg_apr_', '__vg_emalloc', '__vg_ecalloc', '__vg_safe_', '__vg_brigade')):
@@ -111,7 +336,8 @@ def clone_dual_world_goto(functions: list[dict[str, Any]],
             loc_fn = sym.get('location', {}).get('function')
             loc_file = sym.get('location', {}).get('file', '')
             if (loc_fn in subtree_set and not loc_file.startswith('<builtin-library-')
-                    and sname not in rmap and not sname.startswith(('__CPROVER_', '__vulgate_'))):
+                    and sname not in rmap and not sname.startswith(('__CPROVER_', '__vulgate_'))
+                    and not shared_allocator_symbol(sname) and not shared_readonly_symbol(sname)):
                 rmap[sname] = prefix + sname
 
         world_maps[world] = rmap
@@ -593,12 +819,14 @@ def _insert_word_call(function: dict[str, Any], index: int, helper_name: str, he
         'identifier': {'id': helper_name},
         'type': deepcopy(helper_type),
     }}
+    rendered_args = [_cast_word(word, param_types[pos]) for pos, word in enumerate(words)]
+    args_irep = {'id': 'arguments', 'sub': rendered_args} if rendered_args else {'id': 'arguments'}
     call = {
         'instructionId': 'FUNCTION_CALL',
         'code': irep_code('function_call', [
             {'id': 'nil'},
             helper_expr,
-            {'id': 'arguments', 'sub': [_cast_word(word, param_types[pos]) for pos, word in enumerate(words)]},
+            args_irep,
         ]),
         'guard': deepcopy(insn.get('guard', TRUE)),
     }
@@ -910,6 +1138,122 @@ def apply_paired_weaves(functions: list[dict[str, Any]],
     return functions, symbols
 
 
+def _dsl_observer_param_irep(fn: dict[str, Any],
+                             symbols: dict[str, Any],
+                             arg_idx: int,
+                             declared_arity: int,
+                             call_args: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    u64 = {'id': 'unsignedbv', 'namedSub': {'width': {'id': '64'}}}
+    zero = {'id': 'constant', 'namedSub': {'type': deepcopy(u64), 'value': {'id': '0'}}}
+    if arg_idx < 0 or arg_idx >= declared_arity:
+        return zero
+    if call_args is not None:
+        if arg_idx >= len(call_args):
+            return zero
+        return {'id': 'typecast', 'namedSub': {'type': deepcopy(u64)}, 'sub': [deepcopy(call_args[arg_idx])]}
+    params = fn.get('parameterIdentifiers') or []
+    if arg_idx >= len(params):
+        return zero
+    ident = str(params[arg_idx])
+    sym_type = symbols.get(ident, {}).get('type') or u64
+    return {'id': 'typecast', 'namedSub': {'type': deepcopy(u64)}, 'sub': [
+        {'id': 'symbol', 'namedSub': {'identifier': {'id': ident}, 'type': deepcopy(sym_type)}},
+    ]}
+
+
+def _weave_dsl_observer(functions: list[dict[str, Any]],
+                        symbols: dict[str, Any],
+                        w1_names: set[str],
+                        obs: dict[str, Any]) -> bool:
+    if not obs.get('dsl_operations'):
+        return False
+    oid = re.sub(r'[^A-Za-z0-9_]', '_', str(obs.get('id') or 'obs'))
+    helper_name = f'__vulgate_obs_{oid}'
+    if helper_name not in symbols:
+        return False
+    helper_type = symbols[helper_name].get('type') or {}
+    if not helper_type:
+        return False
+    arg_indices = [int(x) for x in (obs.get('arg_indices') or [])]
+    local_names = [str(x) for x in (obs.get('local_names') or [])]
+    declared_arity = len(obs.get('arg_types') or [])
+    target_fn = str(obs.get('function') or '')
+    dsl_cs = obs.get('dsl_callsite') if isinstance(obs.get('dsl_callsite'), dict) else None
+    dsl_ln = obs.get('dsl_line') if isinstance(obs.get('dsl_line'), dict) else None
+    u64 = {'id': 'unsignedbv', 'namedSub': {'width': {'id': '64'}}}
+    zero = {'id': 'constant', 'namedSub': {'type': deepcopy(u64), 'value': {'id': '0'}}}
+    wove_any = False
+    for fn in functions:
+        if fn['name'] not in w1_names:
+            continue
+        insns = fn.get('instructions') or []
+        if not insns:
+            continue
+        base = symbols.get(fn['name'], {}).get('baseName', fn['name'])
+        if target_fn and base != target_fn and fn['name'] != target_fn:
+            continue
+        names = _function_base_symbols(fn, symbols)
+        local_ireps = [_word_irep(fn, symbols, lname, names) or deepcopy(zero) for lname in local_names]
+        if dsl_cs is not None:
+            want_callee = str(dsl_cs.get('callee') or '')
+            want_line = str(dsl_cs['line']) if dsl_cs.get('line') is not None else None
+            exact_sites: list[int] = []
+            all_sites: list[int] = []
+            for idx, insn in enumerate(insns):
+                if insn.get('instructionId') != 'FUNCTION_CALL':
+                    continue
+                ops = (insn.get('code') or {}).get('sub') or []
+                if len(ops) < 3 or ops[1].get('id') != 'symbol':
+                    continue
+                callee_name = symbol_name(ops[1])
+                callee_base = symbols.get(callee_name, {}).get('baseName', callee_name)
+                if callee_base != want_callee and callee_name != want_callee:
+                    continue
+                all_sites.append(idx)
+                loc_line = ((insn.get('sourceLocation') or {}).get('namedSub') or {}).get('line', {}).get('id')
+                if want_line is not None and str(loc_line or '') == want_line:
+                    exact_sites.append(idx)
+            chosen_sites = exact_sites if (want_line is not None and exact_sites) else all_sites
+            for idx in reversed(chosen_sites):
+                insn = fn['instructions'][idx]
+                ops = (insn.get('code') or {}).get('sub') or []
+                cargs = (ops[2].get('sub') or []) if len(ops) >= 3 else []
+                words = [
+                    *[_dsl_observer_param_irep(fn, symbols, a_idx, declared_arity, cargs) for a_idx in arg_indices],
+                    *[deepcopy(item) for item in local_ireps],
+                ]
+                _insert_word_call(fn, idx, helper_name, helper_type, words, insn)
+                wove_any = True
+        elif dsl_ln is not None:
+            want_line = str(dsl_ln['line']) if dsl_ln.get('line') is not None else ''
+            want_file = Path(str(dsl_ln['file'])).name if dsl_ln.get('file') else ''
+            line_idx: int | None = None
+            for idx, insn in enumerate(insns):
+                loc = (insn.get('sourceLocation') or {}).get('namedSub') or {}
+                loc_line = str((loc.get('line') or {}).get('id') or '')
+                loc_file = Path(str((loc.get('file') or {}).get('id') or '')).name
+                if loc_line == want_line and (not want_file or loc_file == want_file):
+                    line_idx = idx
+                    break
+            if line_idx is not None:
+                insn = fn['instructions'][line_idx]
+                words = [
+                    *[_dsl_observer_param_irep(fn, symbols, a_idx, declared_arity, None) for a_idx in arg_indices],
+                    *[deepcopy(item) for item in local_ireps],
+                ]
+                _insert_word_call(fn, line_idx, helper_name, helper_type, words, insn)
+                wove_any = True
+        else:
+            insn = fn['instructions'][0]
+            words = [
+                *[_dsl_observer_param_irep(fn, symbols, a_idx, declared_arity, None) for a_idx in arg_indices],
+                *[deepcopy(item) for item in local_ireps],
+            ]
+            _insert_word_call(fn, 0, helper_name, helper_type, words, insn)
+            wove_any = True
+    return wove_any
+
+
 def weave_observer_maps(functions: list[dict[str, Any]],
                         symbols: dict[str, Any],
                         w1_map: dict[str, str],
@@ -919,6 +1263,8 @@ def weave_observer_maps(functions: list[dict[str, Any]],
     w1_names = set(w1_map.values())
     map_defs = maps or {}
     for obs in observers:
+        if _weave_dsl_observer(functions, symbols, w1_names, obs):
+            continue
         if _weave_structured_observer(
             functions, symbols, w1_names, obs, map_defs.get(str(obs.get('map') or ''), {}),
         ):
@@ -1031,7 +1377,8 @@ def finalize_and_export_goto(functions: list[dict[str, Any]],
                              enable_shadow: bool = True,
                              object_bits: int = 8,
                              target_descriptions: tuple[str, ...] = (),
-                             timeout: int = 180) -> dict[str, Any]:
+                             timeout: int = 180,
+                             timeout_floor: int = 300) -> dict[str, Any]:
     work_dir = Path(work_dir).resolve()
     work_dir.mkdir(parents=True, exist_ok=True)
     goto_instrument = tool_dir / 'goto-instrument'
@@ -1057,19 +1404,23 @@ def finalize_and_export_goto(functions: list[dict[str, Any]],
     fn_payload, sym_payload = transport_view(functions, symbols, mode=FULL)
     fn_file = work_dir / 'paired.functions.json'
     sym_file = work_dir / 'paired.symbols.json'
-    fn_file.write_text(json.dumps(fn_payload, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
-    sym_file.write_text(json.dumps(sym_payload, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
-
     raw_goto = work_dir / 'paired.raw.goto'
-    export_timeout = max(int(timeout), 300)
-    subprocess.run([str(symtab2gb), str(sym_file), '--goto-functions', str(fn_file), '--out', str(raw_goto)],
-                   check=True, timeout=export_timeout, capture_output=True, text=True)
-    if not os.environ.get('VULGATE_SKIP_GOTO_VALIDATION'):
-        subprocess.run([str(goto_instrument), str(raw_goto), '--validate-goto-binary', '--json-ui'],
+    export_timeout = max(int(timeout), int(timeout_floor))
+    try:
+        fn_file.write_text(json.dumps(fn_payload, ensure_ascii=False, separators=(',', ':')) + '\n', encoding='utf-8')
+        sym_file.write_text(json.dumps(sym_payload, ensure_ascii=False, separators=(',', ':')) + '\n', encoding='utf-8')
+        subprocess.run([str(symtab2gb), str(sym_file), '--goto-functions', str(fn_file), '--out', str(raw_goto)],
                        check=True, timeout=export_timeout, capture_output=True, text=True)
-    subprocess.run([str(goto_instrument), '--drop-unused-functions', '--slice-global-inits',
-                    str(raw_goto), str(output_goto)],
-                   check=True, timeout=export_timeout, capture_output=True, text=True)
+        if not os.environ.get('VULGATE_SKIP_GOTO_VALIDATION'):
+            subprocess.run([str(goto_instrument), str(raw_goto), '--validate-goto-binary', '--json-ui'],
+                           check=True, timeout=export_timeout, capture_output=True, text=True)
+        subprocess.run([str(goto_instrument), '--drop-unused-functions', '--slice-global-inits',
+                        str(raw_goto), str(output_goto)],
+                       check=True, timeout=export_timeout, capture_output=True, text=True)
+    finally:
+        fn_file.unlink(missing_ok=True)
+        sym_file.unlink(missing_ok=True)
+        raw_goto.unlink(missing_ok=True)
 
     return {
         'output_goto': str(output_goto),

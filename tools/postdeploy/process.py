@@ -43,6 +43,30 @@ def _install_dsl(pid: int, dsl_path: Path, bridge_dir: Path, session=None):
     return session, script, result, bridge
 
 
+def _decision_repeatable(message: dict) -> bool:
+    event = message.get('payload') or {}
+    if message.get('type') == 'error' or event.get('event') != 'decision':
+        return False
+    snapshot = event.get('snapshot') or {}
+    for read in snapshot.get('map_reads') or []:
+        if read.get('consume'):
+            return False
+    return True
+
+
+def record_episode_event(events: list, message: dict) -> None:
+    if (
+        events
+        and _decision_repeatable(message)
+        and _decision_repeatable(events[-1])
+        and events[-1].get('type') == message.get('type')
+        and events[-1].get('payload') == message.get('payload')
+    ):
+        events[-1]['repeat'] = int(events[-1].get('repeat') or 1) + 1
+        return
+    events.append(message)
+
+
 def process_tree_fd_count(pid: int) -> int:
     if pid <= 0:
         return 0
@@ -157,6 +181,21 @@ class Worker:
         if self.dsl:
             self.session, self.script, result, bridge = _install_dsl(
                 self.process.pid, self.dsl, self.bridge_dir, self.session)
+            from .dsl_telemetry import attach_telemetry, describe_mounts
+            installed = [dict(item) for item in (result.get('installed') or [])]
+            described = {item['id']: item for item in describe_mounts(self.dsl)}
+            for hook in installed:
+                spec = described.get(hook.get('id')) or {}
+                hook['sets'] = spec.get('sets') or []
+                hook['reads'] = spec.get('reads') or []
+            self.telemetry = attach_telemetry(
+                self.session, bridge, installed, self._message)
+            self._dsl_hits = {}
+            try:
+                initial = self.script.exports_sync.status()
+                self._dsl_hits = {str(k): int(v) for k, v in (initial.get('hits') or {}).items()}
+            except Exception:
+                self._dsl_hits = {}
             hooks = result.get('installed') or []
             self.receipt.update(result, backend='dsl-vm-frida',
                                 installed=bool(hooks),
@@ -184,7 +223,7 @@ class Worker:
         if message.get('payload', {}).get('event') == 'barrier':
             self.barriers.put(message['payload']['token'])
         else:
-            self.events.append(message)
+            record_episode_event(self.events, message)
 
     def _record_request_resources(self, outcome: dict, fd_before: int, cursors: dict[str, int]) -> None:
         outcome['worker_alive'] = self.process.poll() is None
@@ -208,6 +247,7 @@ class Worker:
             if self.barriers.get(timeout=self.timeout) != self.serial:
                 raise RuntimeError('event barrier mismatch')
         status = self.script.exports_sync.status() if self.script else None
+        self._await_dsl_events(status, start)
         if status is not None and self.map_names:
             try:
                 info = self.script.exports_sync.mapInfo()
@@ -215,9 +255,45 @@ class Worker:
             except Exception:
                 used = 0
             status['map_sizes'] = {name: used for name in self.map_names}
-        return {'outcome': reply, 'events': self.events[start:],
+        episode_events = self.events[start:]
+        del self.events[start:]
+        return {'outcome': reply, 'events': episode_events,
                 'runtime_status': status,
                 'elapsed_seconds': time.monotonic() - before}
+
+    def _await_dsl_events(self, status, start: int) -> None:
+        if not self.dsl or not status:
+            return
+        hits = {str(k): int(v) for k, v in (status.get('hits') or {}).items()}
+        previous = getattr(self, '_dsl_hits', {})
+        failed = {
+            str(key) for key, value in (status.get('run') or {}).items()
+            if isinstance(value, str) and value.startswith(('fill-error', 'run-error'))
+        }
+        expected = 0
+        for key in set(hits) | set(previous):
+            if key in failed:
+                continue
+            expected += max(0, hits.get(key, 0) - int(previous.get(key, 0)))
+        deadline = time.monotonic() + 0.5
+        got = 0
+        while True:
+            got = 0
+            for msg in self.events[start:]:
+                ev = msg.get('payload') or {}
+                if ev.get('event') in ('decision', 'observation'):
+                    got += max(1, int(msg.get('repeat') or 1))
+            if got >= expected or time.monotonic() >= deadline:
+                break
+            time.sleep(0.01)
+        if got != expected:
+            self.events.append({'type': 'send', 'payload': {
+                'event': 'diagnostic',
+                'diagnostic': 'telemetry_hit_mismatch',
+                'expected_hits': expected,
+                'captured_events': got,
+            }})
+        self._dsl_hits = hits
 
     def close(self):
         if getattr(self, '_closed', False):
@@ -319,7 +395,7 @@ class CLIStreamWorker:
         if message.get('payload', {}).get('event') == 'barrier':
             self.barriers.put(message['payload']['token'])
         else:
-            self.events.append(message)
+            record_episode_event(self.events, message)
 
     def _write_body(self, body: bytes, chunk: int) -> None:
         if not body:
@@ -400,9 +476,11 @@ class CLIStreamWorker:
                 raise RuntimeError('event barrier mismatch')
             status = self.script.exports_sync.status()
         self._release_process()
+        episode_events = self.events[start:]
+        del self.events[start:]
         return {
             'outcome': outcome,
-            'events': self.events[start:],
+            'events': episode_events,
             'runtime_status': status,
             'elapsed_seconds': time.monotonic() - before,
         }

@@ -15,6 +15,7 @@ import struct
 
 from runtime.dsl import parser as dsl_parser
 
+OP_MOV_K32 = 0xB4
 OP_MOV_K64 = 0xB7
 OP_MOV_X64 = 0xBF
 OP_ADD_X64 = 0x0F
@@ -22,6 +23,7 @@ OP_SUB_X64 = 0x1F
 OP_MUL_X64 = 0x2F
 OP_OR_X64 = 0x4F
 OP_AND_X64 = 0x5F
+OP_LSH_K64 = 0x67
 OP_LSH_X64 = 0x6F
 OP_RSH_X64 = 0x7F
 OP_XOR_X64 = 0xAF
@@ -39,6 +41,8 @@ HELPER_GET_REG = 3
 HELPER_READ_U16 = 4
 HELPER_READ_U32 = 5
 HELPER_READ_U64 = 6
+HELPER_SCRATCH_LOAD = 7
+HELPER_SCRATCH_STORE = 8
 HELPER_MAP_SET = 9
 HELPER_MAP_GET = 10
 HELPER_MAP_PRESENT = 11
@@ -46,6 +50,7 @@ HELPER_SET_REG = 13
 OP_SUB_K64 = 0x17
 OP_JGT_K = 0x25
 MAX_LOOP_ITERATIONS = 256
+MAX_SCRATCH_SLOTS = 32
 
 READ_HELPERS = {
     'vg_read_u8': HELPER_READ_U8,
@@ -233,18 +238,25 @@ class Assembler:
     def jump(self, target: str) -> None:
         self.emit(OP_JA, target=target)
 
-    def const(self, dst: int, value: int) -> None:
+    def const(self, dst: int, value: int, preserve: tuple[int, ...] = ()) -> None:
         value &= (1 << 64) - 1
+        if value <= 0x7FFFFFFF:
+            self.emit(OP_MOV_K64, dst, imm=value)
+            return
         if value <= 0xFFFFFFFF:
-            self.emit(OP_MOV_K64, dst, imm=value if value < 0x80000000 else value - (1 << 32))
+            self.emit(OP_MOV_K32, dst, imm=value - (1 << 32))
+            return
+        if value >= 0xFFFFFFFF80000000:
+            self.emit(OP_MOV_K64, dst, imm=value - (1 << 64))
             return
         high = (value >> 32) & 0xFFFFFFFF
         low = value & 0xFFFFFFFF
-        self.const(dst, high)
-        self.emit(0x67, dst, imm=32)  # lsh64
+        self.const(dst, high, preserve=preserve)
+        self.emit(OP_LSH_K64, dst, imm=32)
         if low:
-            self.emit(0xB4, 5, imm=low if low < 0x80000000 else low - (1 << 32))
-            self.emit(OP_OR_X64, dst, 5)
+            aux = next(reg for reg in (5, 4, 9, 7, 8, 6) if reg != dst and reg not in preserve)
+            self.emit(OP_MOV_K32, aux, imm=low if low < 0x80000000 else low - (1 << 32))
+            self.emit(OP_OR_X64, dst, aux)
 
     def finalize(self) -> bytes:
         for pc, target in self.fixups:
@@ -269,7 +281,35 @@ class Compiler:
         self.map_state = map_state
         self.local_slots = local_slots or {}
         self.vars: dict[str, int] = {}
+        self.scratch_depth = 0
         self.asm = Assembler()
+
+    def _push_scratch(self, reg: int) -> int:
+        slot = self.scratch_depth
+        if slot >= MAX_SCRATCH_SLOTS:
+            raise ExprError('expression nesting exceeds VM scratch capacity')
+        self.scratch_depth += 1
+        if reg != 2:
+            self.asm.emit(OP_MOV_X64, 2, reg)
+        self.asm.emit(OP_MOV_K64, 1, imm=slot)
+        self.asm.emit(OP_CALL, imm=HELPER_SCRATCH_STORE)
+        return slot
+
+    def _pop_scratch(self, slot: int, dst: int) -> None:
+        self.asm.emit(OP_MOV_K64, 1, imm=slot)
+        self.asm.emit(OP_CALL, imm=HELPER_SCRATCH_LOAD)
+        if dst != 0:
+            self.asm.emit(OP_MOV_X64, dst, 0)
+        self.scratch_depth -= 1
+
+    def _simple_const(self, node) -> int | None:
+        if node[0] == 'const':
+            return int(node[1])
+        if node[0] == 'sel' and node[1] in self.overrides:
+            return int(self.overrides[node[1]])
+        if node[0] == 'global' and node[1] in self.globals:
+            return int(self.globals[node[1]])
+        return None
 
     def value(self, node, dst: int = 6) -> None:
         kind = node[0]
@@ -328,27 +368,41 @@ class Compiler:
         elif kind == 'unary':
             operator, operand = node[1], node[2]
             if operator == '-':
+                tmp = 8 if dst != 8 else 7
                 self.value(operand, dst)
-                self.asm.emit(OP_MOV_K64, 8, imm=0)
-                self.asm.emit(OP_SUB_X64, 8, dst)
-                self.asm.emit(OP_MOV_X64, dst, 8)
+                self.asm.emit(OP_MOV_K64, tmp, imm=0)
+                self.asm.emit(OP_SUB_X64, tmp, dst)
+                self.asm.emit(OP_MOV_X64, dst, tmp)
             elif operator == '~':
+                tmp = 8 if dst != 8 else 7
                 self.value(operand, dst)
-                self.asm.const(8, 0xFFFFFFFFFFFFFFFF)
-                self.asm.emit(OP_XOR_X64, dst, 8)
+                self.asm.const(tmp, 0xFFFFFFFFFFFFFFFF, preserve=(dst,))
+                self.asm.emit(OP_XOR_X64, dst, tmp)
             else:
-                self.condition(node, self.asm.label('true'), self.asm.label('false'))
-        elif kind == 'bin':
-            operator, left, right = node[1], node[2], node[3]
-            if operator in ('==', '!=', '<', '<=', '>', '>='):
-                yes, no = self.asm.label('cmp'), self.asm.label('cmp')
+                yes = self.asm.label('bool_t')
+                no = self.asm.label('bool_f')
+                done = self.asm.label('bool_end')
                 self.condition(node, yes, no)
                 self.asm.mark(yes)
                 self.asm.const(dst, 1)
-                self.asm.jump(no)  # placeholder patched below? incorrect
+                self.asm.jump(done)
+                self.asm.mark(no)
+                self.asm.const(dst, 0)
+                self.asm.mark(done)
+        elif kind == 'bin':
+            operator, left, right = node[1], node[2], node[3]
+            if operator in ('==', '!=', '<', '<=', '>', '>=', '&&', '||'):
+                yes = self.asm.label('cmp_t')
+                no = self.asm.label('cmp_f')
+                done = self.asm.label('cmp_end')
+                self.condition(node, yes, no)
+                self.asm.mark(yes)
+                self.asm.const(dst, 1)
+                self.asm.jump(done)
+                self.asm.mark(no)
+                self.asm.const(dst, 0)
+                self.asm.mark(done)
             else:
-                self.value(left, dst)
-                self.value(right, 8)
                 opcode = {
                     '+': OP_ADD_X64, '-': OP_SUB_X64, '*': OP_MUL_X64,
                     '&': OP_AND_X64, '|': OP_OR_X64, '^': OP_XOR_X64,
@@ -356,7 +410,20 @@ class Compiler:
                 }.get(operator)
                 if opcode is None:
                     raise ExprError('unsupported operator: ' + operator)
-                self.asm.emit(opcode, dst, 8)
+                rhs_const = self._simple_const(right)
+                if rhs_const is not None:
+                    tmp = 8 if dst != 8 else 7
+                    self.value(left, dst)
+                    self.asm.const(tmp, rhs_const, preserve=(dst,))
+                    self.asm.emit(opcode, dst, tmp)
+                else:
+                    self.value(left, 6)
+                    slot = self._push_scratch(6)
+                    self.value(right, 8)
+                    self._pop_scratch(slot, 0)
+                    self.asm.emit(opcode, 0, 8)
+                    if dst != 0:
+                        self.asm.emit(OP_MOV_X64, dst, 0)
         else:
             raise ExprError('unsupported expression node: ' + kind)
 
@@ -382,8 +449,15 @@ class Compiler:
             return
         if kind == 'bin' and node[1] in ('==', '!=', '<', '<=', '>', '>='):
             operator, left, right = node[1], node[2], node[3]
-            self.value(left, 6)
-            self.value(right, 8)
+            rhs_const = self._simple_const(right)
+            if rhs_const is not None:
+                self.value(left, 6)
+                self.asm.const(8, rhs_const, preserve=(6,))
+            else:
+                self.value(left, 6)
+                slot = self._push_scratch(6)
+                self.value(right, 8)
+                self._pop_scratch(slot, 6)
             if operator == '==':
                 self.asm.emit(OP_JEQ_X, 6, 8, target=yes)
             elif operator == '!=':
@@ -414,11 +488,19 @@ class Compiler:
         if self.map_state is None:
             raise ExprError('map used without a map declaration')
         map_id = self.map_state.map_id(map_name)
-        self.map_key(map_name, key_node, 9)
-        self.value(value_node, 3)
-        self.asm.emit(OP_MOV_K64, 1, imm=map_id)
-        self.asm.emit(OP_MOV_X64, 2, 9)
-        self.asm.emit(OP_CALL, imm=HELPER_MAP_SET)
+        val_const = self._simple_const(value_node)
+        if val_const is not None:
+            self.map_key(map_name, key_node, 2)
+            self.asm.const(3, val_const, preserve=(2,))
+            self.asm.emit(OP_MOV_K64, 1, imm=map_id)
+            self.asm.emit(OP_CALL, imm=HELPER_MAP_SET)
+        else:
+            self.map_key(map_name, key_node, 6)
+            slot = self._push_scratch(6)
+            self.value(value_node, 3)
+            self._pop_scratch(slot, 2)
+            self.asm.emit(OP_MOV_K64, 1, imm=map_id)
+            self.asm.emit(OP_CALL, imm=HELPER_MAP_SET)
 
     def compile_loop(self, variable: str, start: int, bound: int, body: str) -> None:
         """Emit a verifier-bounded countdown loop.

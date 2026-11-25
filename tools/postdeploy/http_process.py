@@ -125,12 +125,16 @@ class HTTPWorker(Worker):
             trace = self.directory / ('trace-%04d.json' % self.serial)
             if self.control.exports_sync.finish(str(trace)) != 0:
                 raise RuntimeError('trace save failed')
-            result.update(json.loads(trace.read_text()))
+            try:
+                result.update(json.loads(trace.read_text()))
+            finally:
+                trace.unlink(missing_ok=True)
             if self.script and not self.dsl:
                 self.script.exports_sync.barrier(self.serial)
                 if self.barriers.get(timeout=self.timeout) != self.serial:
                     raise RuntimeError('event barrier mismatch')
             status = self.script.exports_sync.status() if self.script else None
+            self._await_dsl_events(status, start)
             if status is not None and self.map_names:
                 try:
                     info = self.script.exports_sync.mapInfo()
@@ -152,14 +156,23 @@ class HTTPWorker(Worker):
         result['worker_alive'] = self.process.poll() is None
         result['resource_count_delta'] = process_tree_fd_count(self.process.pid) - fd_before
         result['completion_event_digest'] = completion_event_digest(cursors)
-        return {'outcome': result, 'events': self.events[start:], 'runtime_status': status,
+        episode_events = self.events[start:]
+        del self.events[start:]
+        return {'outcome': result, 'events': episode_events, 'runtime_status': status,
                 'elapsed_seconds': time.monotonic() - before}
 
     def request(self, request):
         connection = http.client.HTTPConnection('127.0.0.1', self.port, timeout=self.timeout)
         status = 0
         try:
-            body = Path(request['body_file']).read_bytes() if request.get('body_file') else None
+            if request.get('body_file'):
+                body = Path(request['body_file']).read_bytes()
+            elif isinstance(request.get('body'), (bytes, bytearray)):
+                body = bytes(request['body'])
+            elif isinstance(request.get('body'), str) and request['body']:
+                body = request['body'].encode('utf-8')
+            else:
+                body = None
             transmit_http(
                 connection,
                 request['method'],
@@ -182,9 +195,11 @@ class HTTPWorker(Worker):
         except (OSError, http.client.HTTPException) as error:
             if request.get('response_kind') != 'http': raise
             raw = getattr(error, 'partial', b'')
+            timed_out = isinstance(error, (TimeoutError, socket.timeout)) or 'timed out' in str(error).lower()
             result = {'http_status': status, 'response_complete': False,
                       'body_sha256': hashlib.sha256(raw).hexdigest(), 'body_length': len(raw),
                       'body_text': raw.decode('utf-8', errors='replace'), 'transport_error': type(error).__name__,
+                      'timed_out': timed_out,
                       'response_headers': []}
         finally:
             connection.close()

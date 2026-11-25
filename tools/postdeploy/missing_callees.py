@@ -118,6 +118,10 @@ def _pretty_signature(name: str, pretty: str) -> tuple[str, list[str]] | None:
     for index, arg in enumerate(raw_args):
         if arg == 'void':
             continue
+        if arg.strip() == '...':
+            rendered.append('...')
+            continue
+        arg = _structify_unknown_pointer(arg, type_words)
         tokens = arg.split()
         if len(tokens) > 1 and tokens[-1] not in type_words and not tokens[-1].endswith('*') and tokens[-1].isidentifier():
             pname = tokens[-1]
@@ -126,7 +130,22 @@ def _pretty_signature(name: str, pretty: str) -> tuple[str, list[str]] | None:
             pname = f'a{index}'
             rendered.append(f'{arg} {pname}')
         names.append(pname)
+    ret = _structify_unknown_pointer(ret, type_words)
     return f'{ret} {name}({", ".join(rendered) if rendered else "void"})', [ret, *rendered]
+
+
+def _structify_unknown_pointer(text: str, known: set[str]) -> str:
+    def replace(match: re.Match[str]) -> str:
+        name = match.group(2)
+        if name in known or name.endswith('_t'):
+            return match.group(0)
+        return f'{match.group(1)}struct {name} *'
+
+    return re.sub(
+        r'(?<!struct )(?<!union )(?<!enum )(^|[\s*])([A-Za-z_][A-Za-z0-9_]*)\s*\*',
+        replace,
+        text,
+    )
 
 
 READONLY_READS = {

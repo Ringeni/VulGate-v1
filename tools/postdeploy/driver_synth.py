@@ -22,15 +22,15 @@ from .snapshot_lifter import apply_snapshot_state
 
 
 _ALLOCATOR_SITE_MACROS = (
-    ('ngx_palloc', '#define ngx_palloc(pool, size) __vg_ngx_palloc((pool), (size), (unsigned)__LINE__)'),
-    ('ngx_pnalloc', '#define ngx_pnalloc(pool, size) __vg_ngx_pnalloc((pool), (size), (unsigned)__LINE__)'),
-    ('ngx_pcalloc', '#define ngx_pcalloc(pool, size) __vg_ngx_pcalloc((pool), (size), (unsigned)__LINE__)'),
-    ('apr_palloc', '#define apr_palloc(pool, size) __vg_apr_palloc((pool), (size), (unsigned)__LINE__)'),
-    ('apr_brigade_create', '#define apr_brigade_create(pool, list) __vg_apr_brigade_create((pool), (list), (unsigned)__LINE__)'),
-    ('apr_bucket_alloc', '#define apr_bucket_alloc(size, list) __vg_apr_bucket_alloc((size), (list), (unsigned)__LINE__)'),
-    ('_emalloc', '#define _emalloc(size) __vg_emalloc((size), (unsigned)__LINE__)'),
-    ('_safe_emalloc', '#define _safe_emalloc(nmemb, size, offset) __vg_safe_emalloc((nmemb), (size), (offset), (unsigned)__LINE__)'),
-    ('_ecalloc', '#define _ecalloc(nmemb, size) __vg_ecalloc((nmemb), (size), (unsigned)__LINE__)'),
+    ('ngx_palloc', 'extern void *__vg_ngx_palloc(ngx_pool_t *pool, size_t size, unsigned callsite);\n#define ngx_palloc(pool, size) __vg_ngx_palloc((pool), (size), (unsigned)__LINE__)'),
+    ('ngx_pnalloc', 'extern void *__vg_ngx_pnalloc(ngx_pool_t *pool, size_t size, unsigned callsite);\n#define ngx_pnalloc(pool, size) __vg_ngx_pnalloc((pool), (size), (unsigned)__LINE__)'),
+    ('ngx_pcalloc', 'extern void *__vg_ngx_pcalloc(ngx_pool_t *pool, size_t size, unsigned callsite);\n#define ngx_pcalloc(pool, size) __vg_ngx_pcalloc((pool), (size), (unsigned)__LINE__)'),
+    ('apr_palloc', 'extern void *__vg_apr_palloc(apr_pool_t *pool, apr_size_t size, unsigned callsite);\n#define apr_palloc(pool, size) __vg_apr_palloc((pool), (size), (unsigned)__LINE__)'),
+    ('apr_brigade_create', 'extern apr_bucket_brigade *__vg_apr_brigade_create(apr_pool_t *p, apr_bucket_alloc_t *list, unsigned callsite);\n#define apr_brigade_create(pool, list) __vg_apr_brigade_create((pool), (list), (unsigned)__LINE__)'),
+    ('apr_bucket_alloc', 'extern void *__vg_apr_bucket_alloc(apr_size_t size, apr_bucket_alloc_t *list, unsigned callsite);\n#define apr_bucket_alloc(size, list) __vg_apr_bucket_alloc((size), (list), (unsigned)__LINE__)'),
+    ('_emalloc', 'extern void *__vg_emalloc(size_t size, unsigned callsite);\n#define _emalloc(size) __vg_emalloc((size), (unsigned)__LINE__)'),
+    ('_safe_emalloc', 'extern void *__vg_safe_emalloc(size_t nmemb, size_t size, size_t offset, unsigned callsite);\n#define _safe_emalloc(nmemb, size, offset) __vg_safe_emalloc((nmemb), (size), (offset), (unsigned)__LINE__)'),
+    ('_ecalloc', 'extern void *__vg_ecalloc(size_t nmemb, size_t size, unsigned callsite);\n#define _ecalloc(nmemb, size) __vg_ecalloc((nmemb), (size), (unsigned)__LINE__)'),
 )
 
 
@@ -90,13 +90,28 @@ def stamp_allocator_callsites(source: str) -> str:
         return source
     lines = source.split('\n')
     last_include = -1
+    depth = 0
+    in_inc_block = False
     for index, line in enumerate(lines):
-        if line.strip().startswith('#include'):
-            last_include = index
-    block = macros
+        stripped = line.strip()
+        if stripped.startswith('#'):
+            if re.match(r'^#\s*(?:if|ifdef|ifndef)\b', stripped):
+                depth += 1
+            elif re.match(r'^#\s*endif\b', stripped):
+                depth = max(0, depth - 1)
+                if depth == 0 and in_inc_block:
+                    last_include = index
+                    in_inc_block = False
+            elif re.match(r'^#\s*include\b', stripped):
+                if depth == 0:
+                    last_include = index
+                else:
+                    in_inc_block = True
+        elif '{' in stripped and depth == 0 and last_include >= 0:
+            break
     if last_include < 0:
-        return '\n'.join([*block, *lines])
-    return '\n'.join([*lines[:last_include + 1], *block, *lines[last_include + 1:]])
+        return '\n'.join([*macros, *lines])
+    return '\n'.join([*lines[:last_include + 1], *macros, *lines[last_include + 1:]])
 
 
 _FILE_SCOPE_DEF = re.compile(
@@ -176,9 +191,11 @@ def prefer_slice_function_bodies(driver: str, slice_sources: list[str]) -> str:
 
 
 def _allocator_coupling_c() -> str:
-    marks = '\n'.join(
-        f'    if (size > {index}u) __CPROVER_set_field(base + {index}, "vulgate_uninitialized", dirty);'
-        for index in range(256)
+    marks = (
+        '    size_t __vg_mark_index;\n'
+        '    __CPROVER_assume(size <= 8192u);\n'
+        '    for (__vg_mark_index = 0; __vg_mark_index < size; ++__vg_mark_index)\n'
+        '        __CPROVER_set_field(base + __vg_mark_index, "vulgate_uninitialized", dirty);'
     )
     dyn_reset = '\n'.join(f'        __vg_alloc_dyn[{index}] = 0;' for index in range(32))
     live_reset = '\n'.join(
@@ -575,6 +592,31 @@ def complete_observable_diff(source: str) -> str:
     return source[:span[0]] + body + source[span[1]:]
 
 
+def mark_parameter_environment(body: str) -> str:
+    kept: list[str] = []
+    for line in body.splitlines():
+        kept.append(line)
+        match = re.search(
+            r'memset\(\s*(&)?([A-Za-z_][A-Za-z0-9_]*)\s*,\s*0\s*,\s*sizeof\(\s*\2\s*\)\s*\)',
+            line,
+        )
+        if match and match.group(2).endswith('_obj'):
+            name = match.group(2)
+            address = f'&{name}' if match.group(1) else name
+            indent = line[:len(line) - len(line.lstrip())]
+            kept.append(
+                f'{indent}__vg_mark_alloc((unsigned char *)({address}), sizeof({name}), 1);'
+            )
+            continue
+        assigned = re.match(r'(\s*)([A-Za-z_][A-Za-z0-9_]*_obj)\s*=\s*0\s*;\s*$', line)
+        if assigned:
+            name = assigned.group(2)
+            kept.append(
+                f'{assigned.group(1)}__vg_mark_alloc((unsigned char *)(&{name}), sizeof({name}), 1);'
+            )
+    return '\n'.join(kept) + ('\n' if body.endswith('\n') else '')
+
+
 def synthesize_paired_goto_driver_c(case_ir: dict[str, Any],
                                     cut_task: dict[str, Any],
                                     abstract_snapshot: dict[str, Any],
@@ -610,10 +652,26 @@ def synthesize_paired_goto_driver_c(case_ir: dict[str, Any],
 
     for inc in sym_scope.get('driver_includes', []):
         headers.append(f'#include {inc}')
-
-    body_c = _generate_cut_driver_body(
-        app_family, case_ir, cut_fn, guard_fn, oracle, sym_scope, abstract_snapshot,
+    helper_includes = (
+        ((case_ir.get('app_profile') or {}).get('symbolic_slice') or {}).get('helper_includes')
+        or []
     )
+    for inc in [*helper_includes, *(sym_scope.get('helper_includes') or [])]:
+        text = str(inc).strip()
+        if not text:
+            continue
+        if text.startswith('#'):
+            line = text
+        elif text[0] in '<"':
+            line = f'#include {text}'
+        else:
+            line = f'#include "{text}"'
+        if line not in headers:
+            headers.append(line)
+
+    body_c = mark_parameter_environment(_generate_cut_driver_body(
+        app_family, case_ir, cut_fn, guard_fn, oracle, sym_scope, abstract_snapshot,
+    ))
     if '__vg_alloc_enter_world' not in body_c:
         slice_texts: list[str] = []
         for raw_path in sym_scope.get('slice_sources') or []:
@@ -624,6 +682,17 @@ def synthesize_paired_goto_driver_c(case_ir: dict[str, Any],
         model = allocator_model_for(app_family, slice_texts)
         if model:
             body_c = model + '\n' + body_c
+    if '__vg_mark_alloc(' in body_c and 'void __vg_mark_alloc(' not in body_c:
+        body_c = (
+            'extern _Bool __vulgate_shadow_active;\n'
+            'static void __vg_mark_alloc(unsigned char *base, size_t size, _Bool dirty) {\n'
+            '    size_t __vg_mark_index;\n'
+            '    if (!__vulgate_shadow_active || !base) return;\n'
+            '    __CPROVER_assume(size <= 8192u);\n'
+            '    for (__vg_mark_index = 0; __vg_mark_index < size; ++__vg_mark_index)\n'
+            '        __CPROVER_set_field(base + __vg_mark_index, "vulgate_uninitialized", dirty);\n'
+            '}\n\n' + body_c
+        )
     profile = case_ir.get('app_profile') or {}
     include_dirs = [
         str(item)
@@ -3970,7 +4039,23 @@ def locate_function_source(source_dir: str | Path,
 _CALLEE_SKIP = {
     'if', 'for', 'while', 'do', 'switch', 'return', 'sizeof', 'offsetof',
     'defined', 'typeof', 'alignof', 'static_assert',
+    'ngx_palloc', 'ngx_pnalloc', 'ngx_pcalloc', 'ngx_pfree',
+    'ngx_log_error', 'ngx_log_error_core', 'ngx_log_debug', 'ngx_log_debug_core',
+    'ngx_log_stderr', 'ngx_write_stderr', 'ngx_log_errno',
+    'apr_palloc', 'apr_pcalloc', 'apr_brigade_create', 'apr_brigade_destroy',
+    'apr_brigade_cleanup', 'apr_bucket_alloc_create', 'apr_bucket_alloc_destroy',
+    'apr_bucket_alloc', 'apr_bucket_free',
+    'ap_log_rerror', 'ap_log_rerror_', 'ap_log_cerror', 'ap_log_cerror_',
+    'ap_log_error', 'ap_log_error_', 'ap_log_perror', 'ap_log_perror_',
+    '_emalloc', '_safe_emalloc', '_ecalloc', '_efree', '_zend_bailout',
+    'php_error_docref', 'zend_error',
 }
+
+_CALLEE_SKIP_PREFIXES = ('ngx_log_', 'ap_log_')
+_ENV_MODELED_CALLEE_FILES = frozenset({
+    'ngx_log.c', 'ngx_palloc.c', 'ngx_alloc.c',
+    'apr_pools.c', 'zend_alloc.c',
+})
 
 
 def _function_body_at(path: Path, function: str) -> str | None:
@@ -4011,10 +4096,10 @@ def guard_callee_files(case_ir: dict[str, Any], names: list[str], hops: int = 2)
             continue
         calls = re.findall(r'(?<![\w])([A-Za-z_]\w*)\s*\(', body)
         for callee in sorted(set(calls)):
-            if callee in _CALLEE_SKIP or callee == function or callee.startswith('__'):
+            if callee in _CALLEE_SKIP or callee == function or callee.startswith('__') or callee.startswith(_CALLEE_SKIP_PREFIXES):
                 continue
             callee_path = locate_function_source(root, callee)
-            if callee_path is None or not callee_path.is_file():
+            if callee_path is None or not callee_path.is_file() or callee_path.name in _ENV_MODELED_CALLEE_FILES:
                 continue
             try:
                 callee_text = callee_path.read_text(encoding='utf-8', errors='replace')
@@ -9131,6 +9216,50 @@ def _resolve_guard_signatures(case_ir: dict[str, Any],
     return signatures, exports
 
 
+_IMPLEMENTED_CUT_HARNESS_KINDS = frozenset({
+    'brotli_stream_refill',
+    'nginx_script_check_length',
+    'nginx_script_regex_start',
+    'nginx_alias_map_uri',
+    'nginx_copy_filter_aio',
+    'nginx_map_variable',
+    'nginx_regex_captures',
+    'nginx_h2_grpc_serializers',
+    'nginx_dav_copy_move',
+    'httpd_vhost_translate',
+    'httpd_h2_c1_setup',
+    'httpd_dav_proppatch',
+    'httpd_session_proxy',
+    'httpd_xml2enc_filter',
+    'httpd_charset_out_filter',
+    'httpd_proxy_html_comment',
+    'httpd_rewrite_lookup',
+    'php_multipart_startup',
+    'php_session_progress',
+})
+
+_DOMAIN_HARNESS_BINDING_RE = re.compile(
+    r'\b(obs1|res1|rc1|det1|ctx1|st1|elen1|fset1|bad_cap|startup_mp)\b'
+)
+
+
+def driver_prefers_kind_harness(oracle: dict[str, Any] | None,
+                                sym_scope: dict[str, Any] | None) -> bool:
+    scope = sym_scope or {}
+    if scope.get('environment_source') == 'prototype':
+        return False
+    kind_name = str(scope.get('cut_harness_kind') or '')
+    if kind_name not in _IMPLEMENTED_CUT_HARNESS_KINDS:
+        return False
+    if kind_name in {'nginx_script_check_length', 'nginx_script_regex_start'}:
+        return True
+    bindings = (oracle or {}).get('bindings') or {}
+    if not isinstance(bindings, dict) or not bindings:
+        return False
+    joined = ' '.join(str(v) for v in bindings.values() if v is not None)
+    return bool(_DOMAIN_HARNESS_BINDING_RE.search(joined))
+
+
 def _generate_cut_driver_body(app_family: str,
                               case_ir: dict[str, Any],
                               cut_fn: str,
@@ -9141,6 +9270,8 @@ def _generate_cut_driver_body(app_family: str,
     if 'inline_driver_c' in sym_scope:
         return str(sym_scope['inline_driver_c'])
 
+    kind_name = sym_scope.get('cut_harness_kind')
+    prefer_kind_harness = driver_prefers_kind_harness(oracle, sym_scope)
     sym_scope['driver_entry'] = ''
     sym_scope.pop('handler_seeds', None)
     sym_scope.pop('handler_decls', None)
@@ -9164,7 +9295,7 @@ def _generate_cut_driver_body(app_family: str,
                     pending = []
                     break
                 signatures.append(found)
-            if len(signatures) >= 2:
+            if len(signatures) >= 2 and not prefer_kind_harness:
                 _store_static_exports(sym_scope, pending)
                 sym_scope['code_word_slots'] = _code_word_slots(sym_scope, guard_fn, chosen)
                 sym_scope['driver_entry'] = ''
@@ -9186,19 +9317,18 @@ def _generate_cut_driver_body(app_family: str,
         entry = _prototype_entry(sym_scope, cut_fn, guard_fn, abstract_snapshot)
     sym_scope['driver_entry'] = entry
     _seed_covering_field_caller(sym_scope, entry, case_ir)
-    kind_name = sym_scope.get('cut_harness_kind')
     signature = _signature_for_cut(sym_scope, entry)
     forced = sym_scope.get('environment_source') == 'prototype'
-    if signature and (forced or not (multi_rejected and kind_name is not None)):
+    if not prefer_kind_harness and signature and (forced or not (multi_rejected and kind_name is not None)):
         return render_prototype_driver(app_family, signature, sym_scope)
     own_static_cut = bool(scope_cut) and entry == scope_cut and entry != guard_fn
-    if not (multi_rejected and kind_name is not None) and (entry not in {guard_fn, cut_fn} or own_static_cut):
+    if not prefer_kind_harness and not (multi_rejected and kind_name is not None) and (entry not in {guard_fn, cut_fn} or own_static_cut):
         pending = []
         bound = _bind_entry_signature(sym_scope, entry, pending)
         if bound is not None:
             _store_static_exports(sym_scope, pending)
             return render_prototype_driver(app_family, bound, sym_scope)
-    if not (multi_rejected and kind_name is not None) and entry in {guard_fn, cut_fn}:
+    if not prefer_kind_harness and not (multi_rejected and kind_name is not None) and entry in {guard_fn, cut_fn}:
         resolved = _resolve_guard_signatures(case_ir, sym_scope)
         if resolved:
             signatures, exports = resolved
@@ -9346,7 +9476,6 @@ void __vg_impact_harness(void) {
 
     if kind == 'nginx_script_check_length':
         return NGINX_ENV_MODEL + '''
-ngx_int_t ngx_http_script_check_length(ngx_http_script_engine_t *e, size_t len);
 void ngx_http_script_copy_code(ngx_http_script_engine_t *e);
 
 typedef struct vg_script_obs {
@@ -9355,52 +9484,38 @@ typedef struct vg_script_obs {
     int clean_exit;
 } vg_script_obs;
 
-static u_char *vg_script_base;
-static size_t vg_script_saved_off;
-static ngx_int_t vg_script_saved_status;
-static int vg_script_saved_clean;
-
-static size_t vg_script_len_code(ngx_http_script_engine_t *e) {
-    e->ip += sizeof(uintptr_t);
-    return 0;
-}
-
-static void vg_script_value_code(ngx_http_script_engine_t *e) {
-    if (!vg_script_base) vg_script_base = e->pos;
-    ngx_http_script_copy_code(e);
-    vg_script_saved_status = e->status;
-    vg_script_saved_off = (size_t)(e->pos - vg_script_base);
-    vg_script_saved_clean = (*(uintptr_t *)e->ip == 0);
-}
-
-u_char *ngx_http_script_run(ngx_http_request_t *r, ngx_str_t *value, void *code_lengths, size_t len, void *code_values);
+static _Bool __vg_script_progress_check;
 
 static void vg_script_engine_cut(uint64_t alloc_len, uint64_t reserved_len, uint64_t copy_len, vg_script_obs *obs) {
     ngx_http_request_t r; ngx_connection_t c; ngx_log_t log;
-    ngx_http_core_main_conf_t cmcf; ngx_pool_t pool; ngx_str_t value;
-    void *mconfs[1];
-    u_char pmem[64], code_buf[64];
-    uintptr_t len_code[2];
+    ngx_pool_t pool;
+    u_char pmem[64], code_buf[64], outbuf[64];
+    ngx_http_script_engine_t e;
     memset(&r, 0, sizeof(r)); memset(&c, 0, sizeof(c)); memset(&log, 0, sizeof(log));
-    memset(&cmcf, 0, sizeof(cmcf)); memset(&pool, 0, sizeof(pool)); memset(&value, 0, sizeof(value));
+    memset(&pool, 0, sizeof(pool)); memset(&e, 0, sizeof(e));
     c.log = &log; r.connection = &c;
     pool.d.last = pmem; pool.d.end = pmem + sizeof(pmem); r.pool = &pool;
-    ngx_http_core_module.ctx_index = 0;
-    mconfs[0] = &cmcf; r.main_conf = mconfs;
-    vg_script_base = 0;
-    vg_script_saved_off = 0;
-    vg_script_saved_status = NGX_HTTP_OK;
-    vg_script_saved_clean = 1;
-    len_code[0] = (uintptr_t)vg_script_len_code;
-    len_code[1] = 0;
     memset(code_buf, 0, sizeof(code_buf));
+    memset(outbuf, 0, sizeof(outbuf));
     ngx_http_script_copy_code_t *cc = (ngx_http_script_copy_code_t *)code_buf;
-    cc->code = vg_script_value_code;
+    cc->code = ngx_http_script_copy_code;
     cc->len = (uintptr_t)copy_len;
-    (void)ngx_http_script_run(&r, &value, len_code, (size_t)alloc_len, code_buf);
-    obs->status = vg_script_saved_status;
-    obs->pos_offset = vg_script_saved_off;
-    obs->clean_exit = vg_script_saved_clean;
+    e.ip = code_buf;
+    e.pos = outbuf;
+    e.end = outbuf + (size_t)alloc_len;
+    e.request = &r;
+    e.status = NGX_HTTP_OK;
+    u_char *ip_before = e.ip;
+    while (*(uintptr_t *) e.ip) {
+        ngx_http_script_copy_code(&e);
+        if (__vg_script_progress_check) {
+            __CPROVER_assert(e.ip != ip_before || *(uintptr_t *)e.ip == 0, "vg.obligation.loop_exit_progress");
+        }
+        break;
+    }
+    obs->status = e.status;
+    obs->pos_offset = (size_t)(e.pos - outbuf);
+    obs->clean_exit = (*(uintptr_t *)e.ip == 0);
     (void)reserved_len;
 }
 
@@ -9414,6 +9529,7 @@ int __vg_run_world_1(uint64_t alloc_len, uint64_t reserved_len, uint64_t copy_le
 }
 
 void __vg_verify_obligations(void) {
+    __vg_script_progress_check = 1;
     uint64_t __vg_in_alloc_len = __vulgate_nondet_u64();
     uint64_t __vg_in_reserved = __vulgate_nondet_u64();
     uint64_t __vg_in_length = __vulgate_nondet_u64();

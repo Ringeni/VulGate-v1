@@ -573,8 +573,14 @@ class CutBreakpoint(gdb.Breakpoint):
         return selector == "first"
 
 def _send_http_requests():
+    import os
     import socket
     import time
+    ready = cfg.get("ready_path")
+    if ready:
+        ready_deadline = time.time() + 30
+        while not os.path.exists(ready) and time.time() < ready_deadline and not capture_phase.get("finished"):
+            time.sleep(0.05)
     for req in cfg.get("http_requests") or []:
         host = req.get("host", "127.0.0.1")
         port = int(req["port"])
@@ -584,17 +590,24 @@ def _send_http_requests():
             "%s: %s\r\n" % (key, value)
             for key, value in (req.get("headers") or {}).items()
         )
-        body = req.get("body") or ""
+        body_hex = req.get("body_hex") or ""
+        if body_hex:
+            body = bytes.fromhex(body_hex)
+        else:
+            text_body = req.get("body") or ""
+            body = text_body.encode("utf-8", errors="replace") if text_body else b""
         payload = "%s %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n%s" % (method, path, host, header_lines)
         if body:
-            payload += "Content-Length: %d\r\n\r\n%s" % (len(body), body)
+            payload += "Content-Length: %d\r\n\r\n" % len(body)
+            raw = payload.encode("utf-8", errors="replace") + body
         else:
             payload += "\r\n"
-        raw = payload.encode("utf-8", errors="replace")
+            raw = payload.encode("utf-8", errors="replace")
         deadline = time.time() + float(req.get("wait_sec", 12))
         while time.time() < deadline:
             try:
                 sock = socket.create_connection((host, port), timeout=0.5)
+                sock.settimeout(float(req.get("wait_sec", 12)))
                 sock.sendall(raw)
                 try:
                     sock.recv(128)
@@ -604,18 +617,18 @@ def _send_http_requests():
                 break
             except Exception:
                 time.sleep(0.05)
-    if selector != "first":
-        def _kick():
-            if capture_phase.get("finished"):
-                return
-            try:
-                gdb.execute("interrupt")
-            except Exception:
-                pass
+    time.sleep(0.3)
+    def _kick():
+        if capture_phase.get("finished"):
+            return
         try:
-            gdb.post_event(_kick)
+            gdb.execute("interrupt")
         except Exception:
             pass
+    try:
+        gdb.post_event(_kick)
+    except Exception:
+        pass
 
 if cfg.get("http_requests"):
     import threading
@@ -627,10 +640,17 @@ for _gdb_cmd in ("set pagination off", "set confirm off", "set follow-fork-mode 
     except Exception:
         pass
 CutBreakpoint(cut_fn)
+try:
+    if cfg.get("ready_path"):
+        open(cfg["ready_path"], "w").close()
+except Exception:
+    pass
 if cfg.get("run_args") is not None:
-    args_str = " ".join(gdb.string_to_argv(x)[0] if x else '""' for x in cfg["run_args"])
+    redir = ""
+    if cfg.get("inferior_stdin"):
+        redir = " < " + str(cfg["inferior_stdin"])
     try:
-        gdb.execute("run " + " ".join(f"'{a}'" for a in cfg["run_args"]))
+        gdb.execute("run " + " ".join(f"'{a}'" for a in cfg["run_args"]) + redir)
     except Exception:
         pass
 
@@ -776,7 +796,13 @@ def capture_concrete_snapshot_via_gdb(executable: Path,
         'output_path': str(out_file),
         'http_requests': list(http_requests or []),
         'stop_on_first': invocation_selector == 'first',
+        'inferior_stdin': '',
+        'ready_path': str(output_dir / 'inferior.ready'),
     }
+    if stdin_bytes:
+        stdin_path = output_dir / 'inferior.stdin'
+        stdin_path.write_bytes(stdin_bytes)
+        cfg['inferior_stdin'] = str(stdin_path)
     cfg_file.write_text(json.dumps(cfg, indent=2) + '\n', encoding='utf-8')
     script_file.write_text(GDB_SNAPSHOT_SCRIPT, encoding='utf-8')
 
@@ -787,7 +813,6 @@ def capture_concrete_snapshot_via_gdb(executable: Path,
 
     subprocess.run(
         ['gdb', '-batch', '-nx', '-x', str(script_file), str(executable)],
-        input=stdin_bytes,
         env=env,
         stdout=(output_dir / 'gdb.stdout.log').open('wb'),
         stderr=(output_dir / 'gdb.stderr.log').open('wb'),
@@ -1032,6 +1057,10 @@ def lift_snapshot_to_abstract_spec(concrete: dict[str, Any] | None,
         'max_pointer_hops': int(symbolization_scope.get('max_pointer_hops', 2)),
         'concrete_constants': concrete_consts,
         **({'episode_step_constants': episode_step_constants} if episode_step_constants is not None else {}),
+        **(
+            {'accessed_members': [str(item) for item in symbolization_scope.get('accessed_members')]}
+            if isinstance(symbolization_scope.get('accessed_members'), list) else {}
+        ),
     }
 
 
@@ -1117,11 +1146,236 @@ def _c_ident(text: str) -> str:
     return cleaned
 
 
+_SKIP_CALLS = frozenset({
+    'if', 'for', 'while', 'switch', 'return', 'sizeof', 'typeof', 'defined',
+    'offsetof', 'static_assert', '_Static_assert', 'alignof', '__alignof__',
+})
+_CALL_NAME = re.compile(r'\b([A-Za-z_]\w*)\s*\(')
+_MEMBER_NAME = re.compile(r'(?:->|\.)\s*([A-Za-z_]\w*)')
+
+
+def _mask_c_text(source: str) -> str:
+    chars = list(source)
+    index = 0
+    limit = len(chars)
+    while index < limit:
+        if chars[index] == '/' and index + 1 < limit and chars[index + 1] == '/':
+            while index < limit and chars[index] != '\n':
+                chars[index] = ' '
+                index += 1
+            continue
+        if chars[index] == '/' and index + 1 < limit and chars[index + 1] == '*':
+            chars[index] = ' '
+            chars[index + 1] = ' '
+            index += 2
+            while index < limit and not (chars[index] == '*' and index + 1 < limit and chars[index + 1] == '/'):
+                if chars[index] != '\n':
+                    chars[index] = ' '
+                index += 1
+            if index < limit:
+                chars[index] = ' '
+            if index + 1 < limit:
+                chars[index + 1] = ' '
+                index += 2
+            continue
+        if chars[index] in ('"', "'"):
+            quote = chars[index]
+            chars[index] = ' '
+            index += 1
+            while index < limit:
+                if chars[index] == '\\':
+                    if chars[index] != '\n':
+                        chars[index] = ' '
+                    if index + 1 < limit and chars[index + 1] != '\n':
+                        chars[index + 1] = ' '
+                    index += 2
+                    continue
+                if chars[index] == quote:
+                    chars[index] = ' '
+                    index += 1
+                    break
+                if chars[index] != '\n':
+                    chars[index] = ' '
+                index += 1
+            continue
+        index += 1
+    return ''.join(chars)
+
+
+def _brace_end(masked: str, open_at: int) -> int | None:
+    depth = 0
+    for index in range(open_at, len(masked)):
+        if masked[index] == '{':
+            depth += 1
+        elif masked[index] == '}':
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
+
+
+def _function_bodies(masked: str) -> dict[str, str]:
+    found: dict[str, str] = {}
+    limit = len(masked)
+    index = 0
+    brace = 0
+    while index < limit:
+        ch = masked[index]
+        if ch == '{':
+            brace += 1
+            index += 1
+            continue
+        if ch == '}':
+            brace = max(0, brace - 1)
+            index += 1
+            continue
+        if brace != 0 or not (ch.isalpha() or ch == '_'):
+            index += 1
+            continue
+        start = index
+        index += 1
+        while index < limit and (masked[index].isalnum() or masked[index] == '_'):
+            index += 1
+        name = masked[start:index]
+        cursor = index
+        while cursor < limit and masked[cursor].isspace():
+            cursor += 1
+        if cursor >= limit or masked[cursor] != '(':
+            continue
+        paren = 0
+        while cursor < limit:
+            if masked[cursor] == '(':
+                paren += 1
+            elif masked[cursor] == ')':
+                paren -= 1
+                if paren == 0:
+                    cursor += 1
+                    break
+            cursor += 1
+        while cursor < limit and masked[cursor].isspace():
+            cursor += 1
+        if cursor >= limit or masked[cursor] != '{' or name in _SKIP_CALLS or name in found:
+            continue
+        close = _brace_end(masked, cursor)
+        if close is None:
+            continue
+        found[name] = masked[cursor:close + 1]
+        index = close + 1
+        brace = 0
+    return found
+
+
+def query_entry_names(scope: dict[str, Any], guards: list[str] | None = None) -> list[str]:
+    kind = str(scope.get('cut_harness_kind') or '')
+    if kind == 'nginx_script_check_length':
+        return ['ngx_http_script_copy_code', 'ngx_http_script_check_length']
+    names: list[str] = []
+    snap = scope.get('concrete_snapshot') or {}
+    snap_cut = ''
+    if isinstance(snap, dict):
+        inner = snap.get('snapshot') or {}
+        if isinstance(inner, dict):
+            snap_cut = str(inner.get('cut_function') or '')
+    for name in [str(scope.get('cut_function') or ''), snap_cut, *(guards or [])]:
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def accessed_members(texts: list[str], entries: list[str]) -> set[str] | None:
+    bodies: dict[str, str] = {}
+    for text in texts:
+        for name, body in _function_bodies(_mask_c_text(text)).items():
+            bodies.setdefault(name, body)
+    pending = [name for name in entries if name in bodies]
+    if not pending:
+        return None
+    seen: set[str] = set()
+    members: set[str] = set()
+    while pending:
+        name = pending.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        body = bodies.get(name) or ''
+        members.update(_MEMBER_NAME.findall(body))
+        for callee in _CALL_NAME.findall(body):
+            if callee in _SKIP_CALLS or callee in seen or callee not in bodies:
+                continue
+            pending.append(callee)
+    return members
+
+
+def _preprocess_flags(flags: list[str]) -> list[str]:
+    kept: list[str] = []
+    for flag in flags:
+        if flag.startswith(('-I', '-D', '-U', '-std', '-include')):
+            kept.append(flag)
+    return kept
+
+
+def translation_texts(sources: list[Path], flags: list[str]) -> list[str]:
+    texts: list[str] = []
+    compile_flags = _preprocess_flags(flags)
+    for path in sources:
+        try:
+            raw = Path(path).read_text(encoding='utf-8', errors='replace')
+        except OSError:
+            continue
+        try:
+            proc = subprocess.run(
+                ['gcc', '-E', '-P', *compile_flags, str(path)],
+                capture_output=True, text=True, timeout=90,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            texts.append(raw)
+            continue
+        if proc.returncode == 0 and proc.stdout.strip():
+            texts.append(proc.stdout)
+        else:
+            texts.append(raw)
+    return texts
+
+
+def bind_accessed_members(scope: dict[str, Any],
+                          guards: list[Any],
+                          sources: list[Path],
+                          flags: list[str]) -> None:
+    if isinstance(scope.get('accessed_members'), list):
+        return
+    names = [
+        str(item.get('function') or '')
+        for item in guards
+        if isinstance(item, dict)
+    ]
+    entries = query_entry_names(scope, names)
+    if not entries or not sources:
+        return
+    raw_texts: list[str] = []
+    for path in sources:
+        try:
+            raw_texts.append(Path(path).read_text(encoding='utf-8', errors='replace'))
+        except OSError:
+            continue
+    found = accessed_members(translation_texts(sources, flags), entries)
+    if found is None:
+        found = accessed_members(raw_texts, entries)
+    if found is None:
+        return
+    scope['accessed_members'] = sorted(found)
+
+
+def _field_member(name: str) -> str:
+    return str(name).split('.')[-1].split('->')[-1]
+
+
 def _selected_object_ids(abstract: dict[str, Any]) -> list[str]:
     objects = abstract.get('objects') or {}
     if not isinstance(objects, dict) or not objects:
         return []
     max_hops = int(abstract.get('max_pointer_hops', 2))
+    accessed = abstract.get('accessed_members')
+    allowed = {str(item) for item in accessed} if isinstance(accessed, list) else None
     roots = abstract.get('roots') or {}
     seeds: list[str] = []
     if isinstance(roots, dict):
@@ -1142,7 +1396,10 @@ def _selected_object_ids(abstract: dict[str, Any]) -> list[str]:
         selected.append(oid)
         if hop == max_hops:
             continue
-        for finfo in (objects[oid].get('fields') or {}).values():
+        fields = objects[oid].get('fields') or {}
+        for fname, finfo in fields.items():
+            if allowed is not None and _field_member(str(fname)) not in allowed:
+                continue
             ref = (finfo or {}).get('ref') or {}
             child = ref.get('object_id')
             if ref.get('kind') == 'object_ref' and child in objects:
@@ -1342,82 +1599,82 @@ def render_snapshot_state_c(abstract: dict[str, Any] | None) -> dict[str, Any]:
         lines.append(f'    __vulgate_snap_sym[{index}] = __vulgate_nondet_u64();')
     lines.append('}')
 
-    def base_expr(world_token: str, oid: str) -> str:
-        return f'({world_token} ? __vulgate_snap_w1_{_c_ident(oid)} : __vulgate_snap_w0_{_c_ident(oid)})'
+    def emit_world(world_token: str) -> None:
+        def base_expr(oid: str) -> str:
+            return f'__vulgate_snap_w{world_token}_{_c_ident(oid)}'
 
-    lines.append('static void __vulgate_instantiate_snapshot(int __vulgate_world) {')
-    lines.append('    unsigned char *__vulgate_obj;')
-    lines.append('    __vulgate_snap_symvec();')
-    lines.append('    if (__vulgate_world == 0) {')
-    lines.append('        if (__vulgate_snap_w0_ready) goto __vulgate_snap_bind;')
-    lines.append('        __vulgate_snap_w0_ready = 1;')
-    lines.append('    } else {')
-    lines.append('        if (__vulgate_snap_w1_ready) goto __vulgate_snap_bind;')
-    lines.append('        __vulgate_snap_w1_ready = 1;')
-    lines.append('    }')
-    for oid in selected:
-        ident = _c_ident(oid)
-        lines.append(f'    __vulgate_obj = {base_expr("__vulgate_world", oid)};')
-        lines.append(f'    memcpy(__vulgate_obj, __vulgate_snap_img_{ident}, sizeof(__vulgate_snap_img_{ident}));')
-    slot = 0
-    for oid, offset, width, _ordinal in scalar_writes:
-        lines.append(f'    __vulgate_obj = {base_expr("__vulgate_world", oid)};')
-        lines.append('    {')
-        lines.append(f'        uint64_t __vulgate_tmp = __vulgate_snap_sym[{slot}];')
-        lines.append(f'        memcpy(__vulgate_obj + {offset}, &__vulgate_tmp, {width});')
-        lines.append('    }')
-        slot += 1
-    for oid, size in buffer_writes:
-        lines.append(f'    __vulgate_obj = {base_expr("__vulgate_world", oid)};')
-        for index in range(size):
-            packed = slot + (index // 8)
-            shift = (index % 8) * 8
-            lines.append(f'    __vulgate_obj[{index}] = (uint8_t)(__vulgate_snap_sym[{packed}] >> {shift});')
-        slot += (size + 7) // 8
-    for owner, field_off, target, target_off in concrete_pointers:
-        target_size = len(images[target])
-        use_off = min(max(0, target_off), target_size)
-        lines.append('    {')
-        lines.append(f'        uintptr_t __vulgate_tmp = (uintptr_t)({base_expr("__vulgate_world", target)} + {use_off});')
-        null_slot = nullable_slots.get((owner, field_off))
-        if null_slot is not None:
-            lines.append(f'        if ((__vulgate_snap_sym[{null_slot}] & 1ULL) == 0ULL) __vulgate_tmp = 0;')
-        lines.append(f'        memcpy({base_expr("__vulgate_world", owner)} + {field_off}, &__vulgate_tmp, sizeof(__vulgate_tmp));')
-        lines.append('    }')
-    for group in order_groups:
-        target_size = len(images[group['target']])
-        offsets = []
-        for _fname, _field_off in group['fields']:
-            offsets.append(slot)
-            slot += 1
-        assume_terms = [f'0ULL <= __vulgate_snap_sym[{offsets[0]}]']
-        for left, right in zip(offsets, offsets[1:]):
-            assume_terms.append(f'__vulgate_snap_sym[{left}] <= __vulgate_snap_sym[{right}]')
-        assume_terms.append(f'__vulgate_snap_sym[{offsets[-1]}] <= {target_size}ULL')
-        lines.append(f'    __CPROVER_assume({" && ".join(assume_terms)});')
-        for (_fname, field_off), sym_index in zip(group['fields'], offsets):
+        lines.append(f'static void __vulgate_instantiate_snapshot_w{world_token}(void) {{')
+        lines.append('    unsigned char *__vulgate_obj;')
+        lines.append('    __vulgate_snap_symvec();')
+        lines.append(f'    if (__vulgate_snap_w{world_token}_ready) goto __vulgate_snap_bind;')
+        lines.append(f'    __vulgate_snap_w{world_token}_ready = 1;')
+        for oid in selected:
+            ident = _c_ident(oid)
+            lines.append(f'    __vulgate_obj = {base_expr(oid)};')
+            lines.append(f'    memcpy(__vulgate_obj, __vulgate_snap_img_{ident}, sizeof(__vulgate_snap_img_{ident}));')
+        slot = 0
+        for oid, offset, width, _ordinal in scalar_writes:
+            lines.append(f'    __vulgate_obj = {base_expr(oid)};')
             lines.append('    {')
-            lines.append(f'        uintptr_t __vulgate_tmp = (uintptr_t)({base_expr("__vulgate_world", group["target"])} + (size_t)__vulgate_snap_sym[{sym_index}]);')
-            lines.append(f'        memcpy({base_expr("__vulgate_world", group["owner"])} + {field_off}, &__vulgate_tmp, sizeof(__vulgate_tmp));')
+            lines.append(f'        uint64_t __vulgate_tmp = __vulgate_snap_sym[{slot}];')
+            lines.append(f'        memcpy(__vulgate_obj + {offset}, &__vulgate_tmp, {width});')
             lines.append('    }')
-    lines.append('__vulgate_snap_bind:')
-    for arg in scalar_args:
-        lines.append(f'    {arg["symbol"]} = __vulgate_snap_sym[{arg["slot"]}];')
-    if code_len_slot is not None:
-        lines.append(f'    __vulgate_snap_code_len = __vulgate_snap_sym[{code_len_slot}];')
-    for rname, oid, offset in root_targets:
-        bound = len(images[oid])
-        use_off = offset if 0 <= offset < bound else 0
-        lines.append(f'    __vulgate_snap_root_{rname} = (void *)({base_expr("__vulgate_world", oid)} + {use_off});')
-        null_slot = nullable_roots.get(rname)
-        if null_slot is not None:
-            lines.append(f'    if ((__vulgate_snap_sym[{null_slot}] & 1ULL) == 0ULL) __vulgate_snap_root_{rname} = 0;')
-    lines.append('    return;')
-    lines.append('}')
+            slot += 1
+        for oid, size in buffer_writes:
+            lines.append(f'    __vulgate_obj = {base_expr(oid)};')
+            for index in range(size):
+                packed = slot + (index // 8)
+                shift = (index % 8) * 8
+                lines.append(f'    __vulgate_obj[{index}] = (uint8_t)(__vulgate_snap_sym[{packed}] >> {shift});')
+            slot += (size + 7) // 8
+        for owner, field_off, target, target_off in concrete_pointers:
+            target_size = len(images[target])
+            use_off = min(max(0, target_off), target_size)
+            lines.append('    {')
+            lines.append(f'        uintptr_t __vulgate_tmp = (uintptr_t)({base_expr(target)} + {use_off});')
+            null_slot = nullable_slots.get((owner, field_off))
+            if null_slot is not None:
+                lines.append(f'        if ((__vulgate_snap_sym[{null_slot}] & 1ULL) == 0ULL) __vulgate_tmp = 0;')
+            lines.append(f'        memcpy({base_expr(owner)} + {field_off}, &__vulgate_tmp, sizeof(__vulgate_tmp));')
+            lines.append('    }')
+        slot_orders = 0
+        for group in order_groups:
+            target_size = len(images[group['target']])
+            offsets = []
+            for _fname, _field_off in group['fields']:
+                offsets.append(slot + slot_orders)
+                slot_orders += 1
+            assume_terms = [f'0ULL <= __vulgate_snap_sym[{offsets[0]}]']
+            for left, right in zip(offsets, offsets[1:]):
+                assume_terms.append(f'__vulgate_snap_sym[{left}] <= __vulgate_snap_sym[{right}]')
+            assume_terms.append(f'__vulgate_snap_sym[{offsets[-1]}] <= {target_size}ULL')
+            lines.append(f'    __CPROVER_assume({" && ".join(assume_terms)});')
+            for (_fname, field_off), sym_index in zip(group['fields'], offsets):
+                lines.append('    {')
+                lines.append(f'        uintptr_t __vulgate_tmp = (uintptr_t)({base_expr(group["target"])} + (size_t)__vulgate_snap_sym[{sym_index}]);')
+                lines.append(f'        memcpy({base_expr(group["owner"])} + {field_off}, &__vulgate_tmp, sizeof(__vulgate_tmp));')
+                lines.append('    }')
+        lines.append('__vulgate_snap_bind:')
+        for arg in scalar_args:
+            lines.append(f'    {arg["symbol"]} = __vulgate_snap_sym[{arg["slot"]}];')
+        if code_len_slot is not None:
+            lines.append(f'    __vulgate_snap_code_len = __vulgate_snap_sym[{code_len_slot}];')
+        for rname, oid, offset in root_targets:
+            bound = len(images[oid])
+            use_off = offset if 0 <= offset < bound else 0
+            lines.append(f'    __vulgate_snap_root_{rname} = (void *)({base_expr(oid)} + {use_off});')
+            null_slot = nullable_roots.get(rname)
+            if null_slot is not None:
+                lines.append(f'    if ((__vulgate_snap_sym[{null_slot}] & 1ULL) == 0ULL) __vulgate_snap_root_{rname} = 0;')
+        lines.append('    return;')
+        lines.append('}')
+
+    emit_world('0')
+    emit_world('1')
 
     prologues = {'0': [], '1': []}
     for world in ('0', '1'):
-        prologues[world].append(f'    __vulgate_instantiate_snapshot({world});')
+        prologues[world].append(f'    __vulgate_instantiate_snapshot_w{world}();')
         for oid, offset, symbol in function_patches:
             prologues[world].append('    {')
             prologues[world].append(f'        uintptr_t __vulgate_fp = (uintptr_t)&{symbol};')
@@ -1530,11 +1787,23 @@ def _declares_root(statement: str, name: str) -> bool:
 
 
 def _strip_root_initializer(statement: str, name: str) -> str:
-    return re.sub(
-        rf'\b{re.escape(name)}\b\s*=(?!=)\s*[^,;]+',
-        name,
-        statement,
-    )
+    match = re.search(rf'\b{re.escape(name)}\b\s*=(?!=)\s*', statement)
+    if not match:
+        return statement
+    index = match.end()
+    depth = 0
+    while index < len(statement):
+        ch = statement[index]
+        if ch in '([{':
+            depth += 1
+        elif ch in ')]}':
+            if depth == 0:
+                break
+            depth -= 1
+        elif ch in ',;' and depth == 0:
+            break
+        index += 1
+    return statement[:match.start()] + name + statement[index:]
 
 
 def _assigned_field_names(statement: str, name: str) -> list[str]:
@@ -1659,28 +1928,76 @@ def _drop_snapshot_root_setup(source: str, names: list[str], kept_fields: dict[s
     return '\n'.join(rewritten)
 
 
+def _parameter_function_spans(source: str, name: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    declared = re.compile(
+        rf'(?:^|[,;({{])\s*(?:(?:const|volatile|register|static|extern)\s+)*'
+        rf'(?:(?:struct|union|enum)\s+[A-Za-z_]\w*|[A-Za-z_]\w*)\s*(?:\*\s*)*\b{re.escape(name)}\b'
+    )
+    pattern = re.compile(r'\b([A-Za-z_]\w*)\s*\(')
+    for match in pattern.finditer(source):
+        if match.group(1) in ('if', 'while', 'for', 'switch', 'sizeof'):
+            continue
+        open_paren = match.end() - 1
+        close_paren = _matching_paren(source, open_paren)
+        if close_paren is None or not declared.search(source[open_paren + 1:close_paren]):
+            continue
+        cursor = close_paren + 1
+        while cursor < len(source) and source[cursor] in ' \t\r\n':
+            cursor += 1
+        if cursor >= len(source) or source[cursor] != '{':
+            continue
+        depth = 0
+        end = None
+        for pos in range(cursor, len(source)):
+            if source[pos] == '{':
+                depth += 1
+            elif source[pos] == '}':
+                depth -= 1
+                if depth == 0:
+                    end = pos + 1
+                    break
+        if end is not None:
+            spans.append((open_paren, end))
+    return spans
+
+
 def _rebind_root_locals(source: str, names: list[str]) -> str:
     typed = _root_local_types(source, names)
     for name, (ctype, is_pointer) in typed.items():
+        protected = _parameter_function_spans(source, name)
         rewritten: list[str] = []
         decl = re.compile(
-            rf'(?:^|[;{{])\s*(?:(?:static|extern|const|volatile|register)\s+)*'
-            rf'(?:(?:struct|union|enum)\s+[A-Za-z_]\w*|[A-Za-z_]\w*)\s*\*?\s*\b{re.escape(name)}\b'
+            rf'(?:^|[;{{,])\s*(?:(?:static|extern|const|volatile|register)\s+)*'
+            rf'(?:(?:struct|union|enum)\s+[A-Za-z_]\w*|[A-Za-z_]\w*)\s*(?:\*\s*)*\b{re.escape(name)}\b'
         )
+        offset = 0
         for line in source.split('\n'):
+            line_start = offset
+            offset += len(line) + 1
             if 'memset' in line or decl.search(line):
                 rewritten.append(line)
                 continue
+
+            def covered(match: re.Match[str], start: int = line_start) -> bool:
+                pos = start + match.start()
+                return any(span_start <= pos < span_end for span_start, span_end in protected)
+
             if is_pointer:
                 line = re.sub(
+                    rf'(?<![&\w])&{re.escape(name)}\b(?!\s*\[)',
+                    lambda match: match.group(0) if covered(match) else f'(({ctype} *)&__vulgate_snap_root_{name})',
+                    line,
+                )
+                line = re.sub(
                     rf'\b{re.escape(name)}\b',
-                    f'(({ctype})__vulgate_snap_root_{name})',
+                    lambda match: match.group(0) if covered(match) else f'(({ctype})__vulgate_snap_root_{name})',
                     line,
                 )
             else:
                 line = re.sub(
                     rf'\b{re.escape(name)}\s*\.',
-                    f'(*(({ctype} *)__vulgate_snap_root_{name})).',
+                    lambda match: match.group(0) if covered(match) else f'(*(({ctype} *)__vulgate_snap_root_{name})).',
                     line,
                 )
             rewritten.append(line)
@@ -2558,7 +2875,9 @@ def apply_snapshot_state(source: str, abstract_snapshot: dict[str, Any] | None) 
     source = _insert_world_prologue(source, '__vg_run_world_0', _retarget_code_wrappers(rendered['world_prologue']['0'], source, symbols))
     source = _insert_world_prologue(source, '__vg_run_world_1', _retarget_code_wrappers(rendered['world_prologue']['1'], source, symbols))
     source = _arm_allocator_coupling(_insert_after_includes(source, rendered['code']))
-    marker = 'static void __vulgate_instantiate_snapshot(int __vulgate_world) {'
-    if '__vulgate_snap_lits(void)' in source and marker in source:
-        source = source.replace(marker, marker + '\n    __vulgate_snap_lits();', 1)
+    if '__vulgate_snap_lits(void)' in source:
+        for world in ('0', '1'):
+            marker = f'static void __vulgate_instantiate_snapshot_w{world}(void) {{'
+            if marker in source:
+                source = source.replace(marker, marker + '\n    __vulgate_snap_lits();', 1)
     return source

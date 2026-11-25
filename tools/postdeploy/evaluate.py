@@ -45,11 +45,16 @@ from .case_compiler import (
     predicate_distance,
     snapshot_predicate_distances,
 )
-from .coverage import edges as trace_edges, summarize as summarize_coverage
+from .coverage import PairCoverage
 from .dsl_front import derive_patch_spec, patch_path as dsl_patch_path
 from .http_process import HTTPWorker
 from .monitors import VMReplay
-from .obligations import build_and_verify_paired_goto_slice, prescan_static_globals, verify_vm_bytecode_equivalence
+from .obligations import (
+    build_and_verify_paired_goto_slice,
+    prescan_static_globals,
+    verify_dsl_observer_bytecode_equivalence,
+    verify_vm_bytecode_equivalence,
+)
 from .process import CAPIWorker, CLIStreamWorker, Worker, process_tree_fd_count
 from .snapshot_lifter import capture_concrete_snapshot_via_gdb, invocation_selector_from_case
 
@@ -2710,6 +2715,42 @@ def request_boundaries_hold(baseline: dict[str, int], current: dict[str, int]) -
     return True
 
 
+def _effective_uid() -> int:
+    getter = getattr(os, 'geteuid', None)
+    return int(getter()) if getter else 1
+
+
+def _httpd_identity() -> dict[str, str]:
+    try:
+        import grp
+        import pwd
+    except ImportError:
+        return {'run_user': 'nobody', 'run_group': 'nogroup'}
+    if _effective_uid() == 0:
+        entry = pwd.getpwnam('nobody')
+        return {'run_user': entry.pw_name, 'run_group': grp.getgrgid(entry.pw_gid).gr_name}
+    return {
+        'run_user': pwd.getpwuid(os.geteuid()).pw_name,
+        'run_group': grp.getgrgid(os.getegid()).gr_name,
+    }
+
+
+def _open_runtime_tree(case_ir: dict[str, Any], root: Path) -> None:
+    if (case_ir.get('app_profile') or {}).get('protocol') != 'httpd_http' or _effective_uid() != 0:
+        return
+    root = Path(root)
+    if not root.exists():
+        return
+    for path in [root, *root.rglob('*')]:
+        try:
+            if path.is_symlink():
+                continue
+            mode = path.stat().st_mode
+            os.chmod(path, mode | (0o777 if path.is_dir() else 0o666))
+        except OSError:
+            continue
+
+
 def restore_fixture_files(case_ir: dict[str, Any], directory: Path) -> None:
     directory = Path(directory).resolve()
     files = (case_ir.get('environment_fixture') or {}).get('files') or {}
@@ -2747,9 +2788,10 @@ def _write_fixture_files(case_ir: dict[str, Any], output_dir: Path) -> None:
             dest.write_text(content, encoding='utf-8')
         else:
             dest.write_bytes(bytes(content))
+    _open_runtime_tree(case_ir, output_dir)
 
 
-def _baseline_http_launch(case_ir: dict[str, Any], output_dir: Path) -> tuple[Path, dict[str, int], list[str], dict[str, Any], Any]:
+def _baseline_http_launch(case_ir: dict[str, Any], output_dir: Path, backend_port: int | None = None) -> tuple[Path, dict[str, int], list[str], dict[str, Any], Any]:
     protocol = case_ir['app_profile']['protocol']
     binfo = (case_ir['app_profile'].get('builds') or {}).get('baseline') or {}
     exe = Path(str(binfo.get('executable', '')))
@@ -2760,17 +2802,23 @@ def _baseline_http_launch(case_ir: dict[str, Any], output_dir: Path) -> tuple[Pa
         if not template:
             return
         module_loads = _render_httpd_module_loads(binfo) if protocol == 'httpd_http' else ''
-        with socket.socket() as backend_sock:
-            backend_sock.bind(('127.0.0.1', 0))
-            backend_port = backend_sock.getsockname()[1]
+        chosen_backend = backend_port
+        if chosen_backend is None:
+            with socket.socket() as backend_sock:
+                backend_sock.bind(('127.0.0.1', 0))
+                chosen_backend = backend_sock.getsockname()[1]
         rendered = template.format(
             root=str(output_dir),
             port=port,
-            backend=backend_port,
+            backend=chosen_backend,
             source_dir=binfo.get('source_dir', ''),
             module_loads=module_loads,
+            **_httpd_identity(),
         )
         (output_dir / 'server.conf').write_text(rendered, encoding='utf-8')
+        for name in ('logs', 'body', 'proxy', 'fastcgi', 'uwsgi', 'scgi', 'www'):
+            (output_dir / name).mkdir(parents=True, exist_ok=True)
+        _open_runtime_tree(case_ir, output_dir)
 
     if protocol == 'nginx_http':
         cmd = [str(exe), '-p', str(output_dir) + '/', '-c', str(output_dir / 'server.conf')]
@@ -2811,8 +2859,12 @@ def _http_world_launch(case_ir: dict[str, Any], output_dir: Path, build_key: str
             backend=backend_port,
             source_dir=binfo.get('source_dir', ''),
             module_loads=module_loads,
+            **_httpd_identity(),
         )
         (output_dir / 'server.conf').write_text(rendered, encoding='utf-8')
+        for name in ('logs', 'body', 'proxy', 'fastcgi', 'uwsgi', 'scgi', 'www'):
+            (output_dir / name).mkdir(parents=True, exist_ok=True)
+        _open_runtime_tree(case_ir, output_dir)
 
     if protocol == 'nginx_http':
         cmd = [str(exe), '-p', str(output_dir) + '/', '-c', str(output_dir / 'server.conf')]
@@ -2826,20 +2878,22 @@ def _http_world_launch(case_ir: dict[str, Any], output_dir: Path, build_key: str
 
 def execute_isolated_poc(case_ir: dict[str, Any], workers: dict[str, Any], health_request: dict[str, Any]) -> dict[str, Any]:
     poc_spec = (case_ir.get('seed_traces') or {}).get('poc_reproducer') or {}
+    work_dir = next(iter(workers.values())).directory
+    operations, health_op = _poc_operations(case_ir, health_request, work_dir)
     poc_res: dict[str, Any] = {'executed': True, 'worlds': {}}
     for mode, worker in workers.items():
         log_mark = worker_log_mark(worker.directory)
         mode_steps = []
-        for item in poc_spec.get('requests') or []:
-            request = _normalized_http_request(item) if isinstance(item, dict) else item
+        for request in operations:
             result = worker.execute(request)
             mode_steps.append({
                 'http_status': result['outcome'].get('http_status'),
+                'result': result['outcome'].get('result'),
                 'response_complete': result['outcome'].get('response_complete'),
                 'decisions': len([msg for msg in result['events'] if msg.get('payload', {}).get('event') == 'decision']),
                 'blocks': len([msg for msg in result['events'] if msg.get('payload', {}).get('action') == 'BLOCK']),
             })
-        health = worker.execute(health_request)
+        health = worker.execute(health_op)
         log_suffix = worker_log_suffix(worker.directory, log_mark)
         world_row = {
             'poc_steps': mode_steps,
@@ -2912,9 +2966,67 @@ def _normalized_http_request(item: dict[str, Any]) -> dict[str, Any]:
         'headers': dict(item.get('headers') or {}),
         'response_kind': item.get('response_kind', 'http'),
     }
+    if item.get('protocol'):
+        request['protocol'] = item['protocol']
     if item.get('body_file'):
         request['body_file'] = item['body_file']
+    if isinstance(item.get('body'), (bytes, bytearray, str)):
+        request['body'] = item['body']
+    if item.get('body_bytes_hex'):
+        request['body'] = bytes.fromhex(str(item['body_bytes_hex']))
     return request
+
+
+def _request_body_bytes(req: dict[str, Any]) -> bytes:
+    if req.get('body_file'):
+        return Path(req['body_file']).read_bytes()
+    body = req.get('body')
+    if isinstance(body, (bytes, bytearray)):
+        return bytes(body)
+    if isinstance(body, str) and body:
+        return body.encode('utf-8')
+    return b''
+
+
+def _brotli_poc_command(case_ir: dict[str, Any], item: dict[str, Any], work_dir: Path, index: int) -> str:
+    if item.get('command'):
+        return str(item['command'])
+    encoder = Path(str(case_ir['app_profile'].get('encoder_binary') or ''))
+    plain = work_dir / f'poc-{index}.plain'
+    encoded = work_dir / f'poc-{index}.br'
+    if item.get('plain_hex'):
+        plain.write_bytes(bytes.fromhex(str(item['plain_hex'])))
+    else:
+        plain.write_bytes(str(item.get('plain_text') or 'A' * 64).encode('utf-8'))
+    subprocess.run(
+        [str(encoder), str(plain), str(encoded), str(int(item.get('quality', 5)))],
+        check=True, timeout=30,
+    )
+    return (
+        f'0 {encoded} {plain} {int(item.get("chunk_in", 64))} '
+        f'{int(item.get("chunk_out", 64))} {int(item.get("first_zero", 0))}'
+    )
+
+
+def _poc_operations(case_ir: dict[str, Any], health_request: Any, work_dir: Path) -> tuple[list[Any], Any]:
+    poc_spec = (case_ir.get('seed_traces') or {}).get('poc_reproducer') or {}
+    protocol = case_ir['app_profile']['protocol']
+    if protocol == 'brotli_stream_rpc':
+        commands = [item for item in (poc_spec.get('commands') or []) if isinstance(item, dict)]
+        ops = [_brotli_poc_command(case_ir, item, work_dir, idx) for idx, item in enumerate(commands)]
+        health = poc_spec.get('health') if isinstance(poc_spec.get('health'), dict) else {
+            'plain_text': 'healthy brotli round trip\n',
+            'quality': 5,
+            'chunk_in': 64,
+            'chunk_out': 64,
+            'first_zero': 0,
+        }
+        return ops, _brotli_poc_command(case_ir, health, work_dir, 900)
+    ops = [
+        _normalized_http_request(item) if isinstance(item, dict) else item
+        for item in (poc_spec.get('requests') or [])
+    ]
+    return ops, health_request
 
 
 def replay_anchor_cases(case_ir: dict[str, Any], fixed_cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -2924,22 +3036,45 @@ def replay_anchor_cases(case_ir: dict[str, Any], fixed_cases: list[dict[str, Any
         for idx, item in enumerate(poc)
         if isinstance(item, dict)
     ]
+    seeds = (case_ir.get('seed_traces') or {}).get('benign_seeds') or []
+    seed_cases = []
+    for item in seeds:
+        if isinstance(item, dict) and (item.get('path') or item.get('uri') or item.get('request')):
+            request = item.get('request') if isinstance(item.get('request'), dict) else item
+            seed_cases.append({
+                'id': str(item.get('id') or f'seed-{len(seed_cases)}'),
+                'request': _normalized_http_request(request),
+            })
+    generic_paths = {'/', '/plain', '/plain.txt', '/dav/source.txt', '/dav/ordinary-dir/', '/dav/ordinary-dir'}
     seen_paths: set[str] = set()
-    ranked: list[dict[str, Any]] = []
+    ordered: list[dict[str, Any]] = []
+
+    def add(case: dict[str, Any]) -> None:
+        request = case.get('request') or {}
+        base = str(request.get('path') or '/').split('?', 1)[0]
+        if base in seen_paths:
+            return
+        seen_paths.add(base)
+        ordered.append(case)
+
+    for case in anchored:
+        add(case)
+    for case in seed_cases:
+        add(case)
+    rest: list[dict[str, Any]] = []
     for case in fixed_cases:
         if not case.get('request'):
             continue
         if '-ord-' in str(case.get('id', '')):
             continue
-        path = str(case['request'].get('path') or '/')
-        base = path.split('?', 1)[0]
+        base = str(case['request'].get('path') or '/').split('?', 1)[0]
         if base in seen_paths:
             continue
-        seen_paths.add(base)
-        ranked.append(case)
-    ranked.sort(key=lambda case: (str(case['request'].get('path') or '/').split('?', 1)[0] in ('/plain', '/plain.txt', '/'), str(case.get('id', ''))))
-    benign = ranked[:2]
-    samples = [*anchored, *benign]
+        rest.append(case)
+    rest.sort(key=lambda case: (str(case['request'].get('path') or '/').split('?', 1)[0] in generic_paths, str(case.get('id', ''))))
+    for case in rest:
+        add(case)
+    samples = ordered[:12]
     if not samples:
         samples = [{'request': {'method': 'GET', 'path': '/', 'headers': {}, 'response_kind': 'http'}}]
     return samples
@@ -3045,7 +3180,9 @@ def _sanitizer_matches_oracle(baseline: dict[str, Any]) -> bool | None:
 def _poc_baseline_fault(baseline: dict[str, Any]) -> bool:
     steps = baseline.get('poc_steps') or []
     protocol_fault = bool(baseline.get('path_mismatch')) or any(
-        (not step.get('response_complete', True)) or int(step.get('http_status') or 0) >= 500
+        step.get('result') == 0
+        or (not step.get('response_complete', True))
+        or int(step.get('http_status') or 0) >= 500
         for step in steps
     )
     matched = _sanitizer_matches_oracle(baseline)
@@ -3065,7 +3202,7 @@ def _poc_patched_outcome(patched: dict[str, Any]) -> tuple[bool, bool, bool]:
     blocked = any(int(step.get('blocks') or 0) > 0 for step in steps)
     alive = bool(patched.get('post_poc_worker_alive')) and not patched.get('process_fatal')
     health = patched.get('post_poc_health_status')
-    health_ok = health in (200, 'ok', 0) or (isinstance(health, int) and 200 <= health < 400)
+    health_ok = health in (200, 'ok', 0, 1) or (isinstance(health, int) and (health == 1 or 200 <= health < 400))
     return blocked, alive, health_ok
 
 
@@ -3263,20 +3400,19 @@ def collect_baseline_dynamic_traces(case_ir: dict[str, Any],
         return []
     output_dir.mkdir(parents=True, exist_ok=True)
     _write_fixture_files(case_ir, output_dir)
-    exe, uniq, cmd, trace_spec, prepare_fn = _baseline_http_launch(case_ir, output_dir)
-    if not exe.is_file():
-        return []
-    worker = UniversalHTTPWorker(cmd, output_dir, trace_spec, timeout=20, prepare=prepare_fn)
     traces: list[dict[str, Any]] = []
-    try:
+    with ExitStack() as stack:
+        peer = stack.enter_context(UniversalBackendPeer()) if protocol in ('nginx_http', 'httpd_http') else None
+        exe, uniq, cmd, trace_spec, prepare_fn = _baseline_http_launch(case_ir, output_dir, backend_port=peer.port if peer else None)
+        if not exe.is_file():
+            return []
+        worker = stack.enter_context(UniversalHTTPWorker(cmd, output_dir, trace_spec, timeout=20, prepare=prepare_fn))
         samples = replay_anchor_cases(case_ir, fixed_cases)
         for sample in samples:
             outcome = worker.execute(sample['request'])
             pcs = outcome['outcome'].get('trace') or []
             if pcs:
                 traces.append(pcs_to_dynamic_trace(list(pcs), uniq))
-    finally:
-        worker.close()
     return traces
 
 
@@ -3286,53 +3422,110 @@ def capture_baseline_cut_snapshot(case_ir: dict[str, Any],
                                   globals_to_read: list[str] | None = None) -> dict[str, Any]:
     protocol = case_ir['app_profile']['protocol']
     empty = {'captured': False, 'invocations': 0, 'call_stacks': [], 'call_edges': [], 'snapshot': None}
+    if protocol == 'brotli_stream_rpc':
+        output_dir.mkdir(parents=True, exist_ok=True)
+        baseline = (case_ir['app_profile'].get('builds') or {}).get('baseline') or {}
+        exe = Path(str(baseline.get('executable') or ''))
+        encoder = Path(str(case_ir['app_profile'].get('encoder_binary') or ''))
+        if not exe.is_file() or not encoder.is_file():
+            return empty
+        plain = output_dir / 'snap.plain'
+        encoded = output_dir / 'snap.br'
+        plain.write_bytes(b'A' * 64)
+        subprocess.run([str(encoder), str(plain), str(encoded), '5'], check=True, timeout=30)
+        root_fn = ((case_ir.get('defect_anchors') or {}).get('root_cause_site') or {}).get('function')
+        guard_fn = str((case_ir.get('guards') or [{}])[0].get('function') or '')
+        cut_function = root_fn or 'BrotliDecoderDecompressStream'
+        stdin_bytes = f'0 {encoded} {plain} 64 64 0\nexit\n'.encode()
+
+        def _capture_brotli(function_name: str) -> dict[str, Any]:
+            return capture_concrete_snapshot_via_gdb(
+                exe,
+                [],
+                function_name,
+                output_dir,
+                stdin_bytes=stdin_bytes,
+                stop_on_first=False,
+                invocation_selector=invocation_selector_from_case(case_ir),
+                max_depth=3,
+                globals_to_read=globals_to_read,
+                pointer_arrays=list(case_ir['app_profile'].get('pointer_arrays') or []),
+                timeout=40,
+            )
+
+        try:
+            snapped = _capture_brotli(cut_function)
+        except (OSError, subprocess.TimeoutExpired):
+            snapped = empty
+        if not snapped.get('captured') and cut_function != 'BrotliDecoderDecompressStream':
+            try:
+                snapped = _capture_brotli('BrotliDecoderDecompressStream')
+            except (OSError, subprocess.TimeoutExpired):
+                return snapped
+        if not snapped.get('captured') and guard_fn and guard_fn not in {cut_function, 'BrotliDecoderDecompressStream'}:
+            try:
+                snapped = _capture_brotli(guard_fn)
+            except (OSError, subprocess.TimeoutExpired):
+                return snapped
+        return snapped
     if protocol not in ('nginx_http', 'httpd_http', 'php_http'):
         return empty
     output_dir.mkdir(parents=True, exist_ok=True)
     _write_fixture_files(case_ir, output_dir)
-    exe, _uniq, cmd, _trace_spec, prepare_fn = _baseline_http_launch(case_ir, output_dir)
-    if not exe.is_file():
-        return empty
-    with socket.socket() as reservation:
-        reservation.bind(('127.0.0.1', 0))
-        port = reservation.getsockname()[1]
-    if prepare_fn is not None:
-        prepare_fn(port)
-    command = [part.replace('{port}', str(port)) for part in cmd]
-    samples = replay_anchor_cases(case_ir, fixed_cases)
-    http_requests = []
-    for sample in samples:
-        req = sample['request']
-        body = ''
-        if req.get('body_file'):
-            body = Path(req['body_file']).read_text(encoding='utf-8', errors='replace')
-        http_requests.append({
-            'host': '127.0.0.1',
-            'port': port,
-            'method': req.get('method', 'GET'),
-            'path': req.get('path', '/'),
-            'headers': dict(req.get('headers') or {}),
-            'body': body,
-            'wait_sec': 12,
-        })
-    root_fn = ((case_ir.get('defect_anchors') or {}).get('root_cause_site') or {}).get('function')
-    cut_function = root_fn or case_ir['guards'][0]['function']
-    try:
-        return capture_concrete_snapshot_via_gdb(
-            exe,
-            command[1:],
-            cut_function,
-            output_dir,
-            http_requests=http_requests,
-            stop_on_first=False,
-            invocation_selector=invocation_selector_from_case(case_ir),
-            max_depth=3,
-            globals_to_read=globals_to_read,
-            pointer_arrays=list(case_ir['app_profile'].get('pointer_arrays') or []),
-            timeout=40,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return empty
+    with ExitStack() as stack:
+        peer = stack.enter_context(UniversalBackendPeer()) if protocol in ('nginx_http', 'httpd_http') else None
+        exe, _uniq, cmd, _trace_spec, prepare_fn = _baseline_http_launch(case_ir, output_dir, backend_port=peer.port if peer else None)
+        if not exe.is_file():
+            return empty
+        with socket.socket() as reservation:
+            reservation.bind(('127.0.0.1', 0))
+            port = reservation.getsockname()[1]
+        if prepare_fn is not None:
+            prepare_fn(port)
+        command = [part.replace('{port}', str(port)) for part in cmd]
+        samples = replay_anchor_cases(case_ir, fixed_cases)
+        http_requests = []
+        for sample in samples:
+            req = sample['request']
+            body = _request_body_bytes(req)
+            http_requests.append({
+                'host': '127.0.0.1',
+                'port': port,
+                'method': req.get('method', 'GET'),
+                'path': req.get('path', '/'),
+                'headers': {str(key): str(value) for key, value in (req.get('headers') or {}).items()},
+                'body_hex': body.hex(),
+                'wait_sec': 12,
+            })
+        root_fn = ((case_ir.get('defect_anchors') or {}).get('root_cause_site') or {}).get('function')
+        guard_fn = str(case_ir['guards'][0]['function'])
+        cut_function = root_fn or guard_fn
+
+        def _capture_http(function_name: str) -> dict[str, Any]:
+            return capture_concrete_snapshot_via_gdb(
+                exe,
+                command[1:],
+                function_name,
+                output_dir,
+                http_requests=http_requests,
+                stop_on_first=False,
+                invocation_selector=invocation_selector_from_case(case_ir),
+                max_depth=3,
+                globals_to_read=globals_to_read,
+                pointer_arrays=list(case_ir['app_profile'].get('pointer_arrays') or []),
+                timeout=45,
+            )
+
+        try:
+            snapped = _capture_http(cut_function)
+        except (OSError, subprocess.TimeoutExpired):
+            snapped = empty
+        if not snapped.get('captured') and guard_fn and guard_fn != cut_function:
+            try:
+                snapped = _capture_http(guard_fn)
+            except (OSError, subprocess.TimeoutExpired):
+                return snapped
+        return snapped
 
 
 def outcome_is_error(outcome: dict[str, Any]) -> bool:
@@ -3473,7 +3666,8 @@ def evaluate_case(vuln_spec_or_path: dict[str, Any] | Path,
                   patch_spec_or_path: dict[str, Any] | Path,
                   app_profile_or_path: dict[str, Any] | Path,
                   output_dir: Path,
-                  cbmc_bin: Path | None = None) -> dict[str, Any]:
+                  cbmc_bin: Path | None = None,
+                  dsl_patch: Path | None = None) -> dict[str, Any]:
     import os
 
     started = time.monotonic()
@@ -3494,9 +3688,13 @@ def evaluate_case(vuln_spec_or_path: dict[str, Any] | Path,
             cbmc_bin = Path('/mnt/d/Codex/2026-11-03/goal-042fb9fb-01ec-4a00-960b-c95a63665f9e/work/general-implementation/reproducible-toolchain-v3/cbmc/usr/bin/cbmc')
 
     case_id = str(vuln_spec.get('case_id') or '')
-    case_dsl_patch = dsl_patch_path(case_id) if case_id else None
+    if dsl_patch is not None:
+        case_dsl_patch = Path(dsl_patch).resolve()
+    elif isinstance(patch_spec_or_path, (Path, str)) and str(patch_spec_or_path).endswith('.vg'):
+        case_dsl_patch = Path(patch_spec_or_path).resolve()
+    else:
+        case_dsl_patch = dsl_patch_path(case_id) if case_id else None
     if case_dsl_patch is not None:
-        # Guard/action/map model comes from the same .vg the main chain installs.
         patch_spec = derive_patch_spec(case_dsl_patch, patch_spec)
 
     case_ir = compile_case(vuln_spec, patch_spec, app_profile, output_dir)
@@ -3508,22 +3706,31 @@ def evaluate_case(vuln_spec_or_path: dict[str, Any] | Path,
             g, cbmc_bin, output_dir / 'symbolic' / f'vm_{g["id"]}',
             timeout=case_ir['budgets']['solver_timeout_sec'],
         )
+    observer_vm_proofs: dict[str, dict[str, Any]] = {}
+    for obs in case_ir.get('observers') or []:
+        if obs.get('dsl_vm_rule_path'):
+            observer_vm_proofs[obs['id']] = verify_dsl_observer_bytecode_equivalence(
+                obs, cbmc_bin, output_dir / 'symbolic' / f'vm_obs_{obs["id"]}',
+                timeout=case_ir['budgets']['solver_timeout_sec'],
+            )
 
-    if app_profile['protocol'] in ('nginx_http', 'httpd_http', 'php_http'):
+    if app_profile['protocol'] in ('nginx_http', 'httpd_http', 'php_http', 'brotli_stream_rpc'):
         fixed_preview: list[dict[str, Any]] = []
-        try:
-            fixed_preview, _guided_preview = synthesize_corpus_from_fixture_and_profile(
-                case_ir, output_dir / 'corpus-anchor', None,
-            )
-        except Exception as exc:
-            case_ir['anchor_corpus_error'] = f'{type(exc).__name__}: {exc}'[-500:]
-        try:
-            case_ir['dynamic_traces'] = collect_baseline_dynamic_traces(
-                case_ir, fixed_preview, output_dir / 'trace-anchor',
-            )
-        except Exception as exc:
-            case_ir['dynamic_traces'] = []
-            case_ir['anchor_trace_error'] = f'{type(exc).__name__}: {exc}'[-500:]
+        case_ir['dynamic_traces'] = []
+        if app_profile['protocol'] in ('nginx_http', 'httpd_http', 'php_http'):
+            try:
+                fixed_preview, _guided_preview = synthesize_corpus_from_fixture_and_profile(
+                    case_ir, output_dir / 'corpus-anchor', None,
+                )
+            except Exception as exc:
+                case_ir['anchor_corpus_error'] = f'{type(exc).__name__}: {exc}'[-500:]
+            try:
+                case_ir['dynamic_traces'] = collect_baseline_dynamic_traces(
+                    case_ir, fixed_preview, output_dir / 'trace-anchor',
+                )
+            except Exception as exc:
+                case_ir['dynamic_traces'] = []
+                case_ir['anchor_trace_error'] = f'{type(exc).__name__}: {exc}'[-500:]
         try:
             globals_needed = prescan_static_globals(
                 case_ir, cbmc_bin, output_dir / 'symbolic' / 'prescan',
@@ -3570,19 +3777,24 @@ def evaluate_case(vuln_spec_or_path: dict[str, Any] | Path,
     protocol = app_profile['protocol']
     patch_manifest_path = Path(case_ir['deployment']['patch_manifest'])
     actions_catalog_path = Path(case_ir['deployment']['actions_catalog'])
-    bridge_path = Path(case_ir['deployment']['bridge'])
+    bridge_path = ROOT / 'build' / 'frida-vm' / 'vulgate_frida.so'
+    if not bridge_path.is_file():
+        bridge_path = Path(case_ir['deployment']['bridge'])
 
-    rules_for_replay = {
-        g['id']: {
-            'path': Path(g['rule_path']),
+    rules_for_replay = {}
+    for g in case_ir['guards']:
+        rule = {
+            'path': Path(g['dsl_vm_rule_path']) if g.get('dsl_vm_rule_path') else Path(g['rule_path']),
             'step_limit': g['step_limit'],
             'observations': g.get('map_reads', []),
         }
-        for g in case_ir['guards']
-    }
+        rules_for_replay[g['id']] = rule
+        mount_id = g.get('dsl_mount_id')
+        if mount_id and mount_id not in rules_for_replay:
+            rules_for_replay[mount_id] = rule
 
     episode_records: list[dict[str, Any]] = []
-    coverage_pairs: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
+    coverage = PairCoverage()
     latencies_ms: dict[str, list[float]] = {'baseline': [], 'patched': []}
     hook_totals = {
         'observations': 0,
@@ -3601,9 +3813,7 @@ def evaluate_case(vuln_spec_or_path: dict[str, Any] | Path,
     best_predicate_distances: dict[str, dict[str, float]] = {}
     poc_runtime_verification: dict[str, Any] | None = None
 
-    dsl_path = ROOT / 'runtime' / 'dsl' / 'patches' / (str(case_ir['case_id']) + '.vg')
-    if not dsl_path.is_file():
-        dsl_path = None
+    dsl_path = case_dsl_patch if (case_dsl_patch is not None and case_dsl_patch.is_file()) else None
     with ExitStack() as stack:
         peer = stack.enter_context(UniversalBackendPeer()) if protocol in ('nginx_http', 'httpd_http') else None
         workers: dict[str, Any] = {}
@@ -3697,8 +3907,10 @@ def evaluate_case(vuln_spec_or_path: dict[str, Any] | Path,
                         backend=peer.port if peer else 0,
                         source_dir=b_info.get('source_dir', ''),
                         module_loads=_render_httpd_module_loads(b_info) if protocol == 'httpd_http' else '',
+                        **_httpd_identity(),
                     )
                     (d / 'server.conf').write_text(rendered, encoding='utf-8')
+                    _open_runtime_tree(case_ir, d)
 
                 if protocol == 'nginx_http':
                     cmd = [str(exe_p), '-p', str(wdir) + '/', '-c', str(wdir / 'server.conf')]
@@ -3726,7 +3938,12 @@ def evaluate_case(vuln_spec_or_path: dict[str, Any] | Path,
         vm_replayer = VMReplay(bridge_path, rules_for_replay)
         stack.callback(vm_replayer.close)
 
-        guards_by_id = {g['id']: g for g in case_ir['guards']}
+        guards_by_id = {}
+        for g in case_ir['guards']:
+            guards_by_id[g['id']] = g
+            mount_id = g.get('dsl_mount_id')
+            if mount_id:
+                guards_by_id[str(mount_id)] = g
         sym_regions = symbolic_report.get('impact_regions', {}).get('regions', [])
         sym_input_names = {x['name'] for x in case_ir.get('symbolization_scope', {}).get('symbolic_inputs', [])}
         inv_map = case_ir.get('symbolization_scope', {}).get('snapshot_to_symbolic_exprs', {})
@@ -3747,10 +3964,15 @@ def evaluate_case(vuln_spec_or_path: dict[str, Any] | Path,
             if getattr(worker, 'process', None) is not None and worker.process.poll() is None
         }
         cases_started = 0
+        consecutive_patched_timeouts = 0
+        guided_patched_timeouts = 0
+        dynamic_stall_circuit_breaker = False
         while True:
             if pending_fixed:
                 case = pending_fixed.pop(0)
             elif pending_guided:
+                if dynamic_stall_circuit_breaker:
+                    break
                 pending_guided.sort(key=lambda item: guided_case_rank(
                     item, triggered_hook_ids, best_predicate_distances, visited_region_indices,
                 ))
@@ -3831,6 +4053,18 @@ def evaluate_case(vuln_spec_or_path: dict[str, Any] | Path,
             hook_totals['pass_decisions'] += (replay['decisions'] - replay['blocks'])
             hook_totals['diagnostics'] += replay['diagnostics']
             hook_totals['replay_violations'] += len(replay['violations'])
+            patched_timed_out = bool(outcomes['patched'].get('timed_out'))
+            if patched_timed_out:
+                consecutive_patched_timeouts += 1
+                if case.get('stream_kind') == 'guided_fuzz':
+                    guided_patched_timeouts += 1
+                if 'patched' in holders:
+                    holders['patched'].restart()
+                    workers['patched'] = holders['patched'].worker
+                if not pending_fixed and (consecutive_patched_timeouts >= 4 or guided_patched_timeouts >= 8):
+                    dynamic_stall_circuit_breaker = True
+            else:
+                consecutive_patched_timeouts = 0
 
             hook_totals['map_retention_leaks'] += count_transient_map_leaks(
                 transient_map_names(case_ir), vm_replayer.tables, execs['patched'].get('runtime_status'),
@@ -3867,7 +4101,9 @@ def evaluate_case(vuln_spec_or_path: dict[str, Any] | Path,
             )
 
             mark_error_fallback(outcomes['baseline'], outcomes['patched'], replay['blocks'])
-            coverage_pairs.append((case['id'], outcomes['baseline'], outcomes['patched']))
+            coverage.add(case['id'], outcomes['baseline'], outcomes['patched'])
+            for outcome in outcomes.values():
+                outcome.pop('trace', None)
             with gzip.open(output_dir / 'runtime' / f'episode-{case["id"]}.json.gz', 'wt', encoding='utf-8') as gz:
                 json.dump({
                     'case': case,
@@ -3886,6 +4122,7 @@ def evaluate_case(vuln_spec_or_path: dict[str, Any] | Path,
                 'decisions': replay['decisions'],
                 'blocks': replay['blocks'],
                 'replay_violations': replay['violations'],
+                'runtime_diagnostics': replay.get('runtime_diagnostics') or [],
                 'region_hits': episode_hits,
                 'nearest_unhit_region_distance': episode_unhit_distance,
                 'baseline_fault': outcome_is_error(outcomes['baseline']),
@@ -3897,21 +4134,23 @@ def evaluate_case(vuln_spec_or_path: dict[str, Any] | Path,
             episode_records.append(episode_record)
 
         poc_spec = case_ir.get('seed_traces', {}).get('poc_reproducer')
-        if poc_spec and poc_spec.get('requests'):
+        if poc_spec and (poc_spec.get('requests') or poc_spec.get('commands')):
             poc_res: dict[str, Any] = {'executed': True, 'worlds': {}}
             health_case = fixed_cases[0]
-            health_op = operation_payload(protocol, health_case)
+            fallback_health = operation_payload(protocol, health_case)
+            poc_ops, health_op = _poc_operations(case_ir, fallback_health, workers['baseline'].directory)
             for mode, w in workers.items():
                 log_mark = worker_log_mark(w.directory)
                 mode_steps = []
                 mode_hooks: list[str] = []
-                for r_item in poc_spec['requests']:
-                    r_exec = w.execute(_normalized_http_request(r_item) if isinstance(r_item, dict) else r_item)
+                for r_item in poc_ops:
+                    r_exec = w.execute(r_item)
                     mode_steps.append({
                         'http_status': r_exec['outcome'].get('http_status'),
+                        'result': r_exec['outcome'].get('result'),
                         'response_complete': r_exec['outcome'].get('response_complete'),
-                        'decisions': len([m for m in r_exec['events'] if m.get('payload', {}).get('event') == 'decision']),
-                        'blocks': len([m for m in r_exec['events'] if m.get('payload', {}).get('action') == 'BLOCK']),
+                        'decisions': sum(max(1, int(m.get('repeat') or 1)) for m in r_exec['events'] if m.get('payload', {}).get('event') == 'decision'),
+                        'blocks': sum(max(1, int(m.get('repeat') or 1)) for m in r_exec['events'] if m.get('payload', {}).get('action') == 'BLOCK'),
                     })
                     if mode == 'patched':
                         for hook in touched_hook_ids(r_exec['events']):
@@ -3954,7 +4193,7 @@ def evaluate_case(vuln_spec_or_path: dict[str, Any] | Path,
             })
             poc_runtime_verification = poc_res
 
-    cov_summary = summarize_coverage(coverage_pairs)
+    cov_summary = coverage.finish()
     (output_dir / 'coverage.json').write_text(json.dumps(cov_summary, indent=2) + '\n', encoding='utf-8')
 
     fixed_valid = [
@@ -3997,11 +4236,43 @@ def evaluate_case(vuln_spec_or_path: dict[str, Any] | Path,
     installation_fields = installation_report_fields(
         case_ir, installation_receipt, total_required_hooks, installed_hooks_count, 'installation-receipt.json',
     )
-    vm_checked = sum(int(item.get('checked_properties') or 0) for item in vm_proofs.values())
-    vm_instructions = [int(item.get('bytecode_instructions') or 0) for item in vm_proofs.values()]
+    all_vm_items = [*vm_proofs.values(), *observer_vm_proofs.values()]
+    vm_checked = sum(int(item.get('checked_properties') or 0) for item in all_vm_items)
+    vm_instructions = [
+        max(int(item.get('bytecode_instructions') or 0), int(item.get('dsl_vm_bytecode_instructions') or 0))
+        for item in all_vm_items
+    ]
+    if any(item.get('status') == 'VIOLATED' for item in all_vm_items):
+        o1_overall_status = 'VIOLATED'
+    elif vm_proofs and all(item.get('status') == 'PROVED' for item in all_vm_items):
+        o1_overall_status = 'PROVED'
+    else:
+        o1_overall_status = 'UNRESOLVED'
 
     med_base = statistics.median(latencies_ms['baseline']) if latencies_ms['baseline'] else 0.0
     med_patch = statistics.median(latencies_ms['patched']) if latencies_ms['patched'] else 0.0
+    target_report = {
+        **symbolic_report.get('target_vulnerability_elimination', {'status': 'UNRESOLVED'}),
+        **isolated_poc_report_fields(
+            poc_runtime_verification,
+            bool((symbolic_report.get('target_vulnerability_elimination') or {}).get('baseline_vulnerability_reproduced_in_model')),
+        ),
+    }
+    if o1_overall_status == 'VIOLATED' and target_report.get('status') != 'VIOLATED':
+        failed_bytecode = []
+        for item in all_vm_items:
+            if item.get('status') == 'VIOLATED':
+                failed_bytecode.extend(item.get('failed_properties') or [])
+        target_report['status'] = 'VIOLATED'
+        target_report['cut_local_status'] = 'VIOLATED'
+        target_report['installed_bytecode_divergence'] = True
+        divergence = list(target_report.get('counterexamples') or [])
+        divergence.append({
+            'property': 'vg.target.installed_bytecode',
+            'description': 'vg.target.installed_bytecode',
+            'failed_properties': failed_bytecode[:4],
+        })
+        target_report['counterexamples'] = divergence
 
     final_report = {
         'schema': 'vulgate.evaluation_report/v2',
@@ -4009,6 +4280,7 @@ def evaluate_case(vuln_spec_or_path: dict[str, Any] | Path,
         'application': case_ir['application_name'],
         'elapsed_seconds': time.monotonic() - started,
         'identities': case_ir['identities'],
+        'snapshot_lift': symbolic_report.get('snapshot_lift') or {'mode': 'driver_supplied'},
         'installation': {
             **installation_fields,
             'required_hooks': total_required_hooks,
@@ -4018,22 +4290,17 @@ def evaluate_case(vuln_spec_or_path: dict[str, Any] | Path,
         },
         'correctness_and_safety': {
             'vm_bytecode_equivalence': {
-                'status': 'PROVED' if vm_proofs and all(v['status'] == 'PROVED' for v in vm_proofs.values()) else 'UNRESOLVED',
+                'status': o1_overall_status,
                 'checked_properties': vm_checked,
                 'max_instructions': max(vm_instructions) if vm_instructions else 0,
                 'guards': vm_proofs,
+                **({'observers': observer_vm_proofs} if observer_vm_proofs else {}),
             },
             'action_and_caller_continuation': {
                 **symbolic_report.get('action_and_caller_continuation', {'status': 'UNRESOLVED'}),
                 'verification_tasks': verification_task_rows(symbolic_report),
             },
-            'target_vulnerability_elimination': {
-                **symbolic_report.get('target_vulnerability_elimination', {'status': 'UNRESOLVED'}),
-                **isolated_poc_report_fields(
-                    poc_runtime_verification,
-                    bool((symbolic_report.get('target_vulnerability_elimination') or {}).get('baseline_vulnerability_reproduced_in_model')),
-                ),
-            },
+            'target_vulnerability_elimination': target_report,
             'pass_path_noninterference': symbolic_report.get('pass_path_noninterference', {'status': 'UNRESOLVED'}),
             'replay_attribution': {
                 'patch_footprint': footprint,
@@ -4051,6 +4318,8 @@ def evaluate_case(vuln_spec_or_path: dict[str, Any] | Path,
                 'total_observations': hook_totals['observations'],
                 'total_vm_decisions': hook_totals['decisions'],
                 'vm_replay_mismatches': hook_totals['replay_violations'],
+                'runtime_diagnostics': hook_totals['diagnostics'],
+                'dynamic_stall_circuit_breaker': dynamic_stall_circuit_breaker,
                 'predicate_branch_coverage': best_predicate_distances,
             },
             'symbolic_impact_regions': {
@@ -4200,8 +4469,9 @@ def main() -> None:
     parser.add_argument('--app', type=Path, required=True)
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--cbmc', type=Path, default=None)
+    parser.add_argument('--dsl', type=Path, default=None)
     args = parser.parse_args()
-    report = evaluate_case(args.vuln, args.patch, args.app, args.out, args.cbmc)
+    report = evaluate_case(args.vuln, args.patch, args.app, args.out, args.cbmc, args.dsl)
     print(json.dumps({
         'case_id': report['case_id'],
         'installation': report['installation']['status'],

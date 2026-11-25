@@ -37,24 +37,27 @@ class VMReplay:
             self.handles[hook] = (handle, definition.get('step_limit', 4096))
 
     def check(self, events):
-        violations, decisions, observations, blocks, diagnostics = [], 0, 0, 0, 0
+        violations, runtime_diagnostics = [], []
+        decisions, observations, blocks, diagnostics = 0, 0, 0, 0
         for message in events:
+            repeat = max(1, int(message.get('repeat') or 1))
             if message.get('type') == 'error':
-                violations.append({'kind': 'agent_error', 'detail': message.get('description')})
+                runtime_diagnostics.append({'kind': 'agent_error', 'detail': message.get('description'), 'count': repeat})
+                diagnostics += repeat
                 continue
             event = message.get('payload', {})
             if event.get('event') == 'diagnostic':
-                diagnostics += 1
-                violations.append({'kind': 'runtime_diagnostic', 'detail': event})
+                diagnostics += repeat
+                runtime_diagnostics.append({'kind': 'runtime_diagnostic', 'detail': event, 'count': repeat})
             if event.get('event') == 'observation':
-                observations += 1
+                observations += repeat
                 key = (event['map'], event['scope'], event['key'])
                 if event['operation'] == 'delete': self.tables.pop(key, None)
                 elif event['result'] == 0: self.tables[key] = int(event['value'])
             if event.get('event') != 'decision': continue
-            decisions += 1
-            blocks += event['action'] == 'BLOCK'
-            diagnostics += bool(event.get('diagnostic'))
+            decisions += repeat
+            blocks += repeat if event['action'] == 'BLOCK' else 0
+            diagnostics += repeat if event.get('diagnostic') else 0
             if decision_blocked_by_full_map(event):
                 continue
             snapshot = event.get('snapshot')
@@ -98,13 +101,14 @@ class VMReplay:
             finally:
                 if safe_read_count and self._has_read_replay:
                     self.lib.vg_set_replay_reads(None, 0)
-            if raw != event['vm_decision'] or ('PASS' if raw == 0 else 'BLOCK') != event['action']:
+            if raw != int(event['vm_decision']) or ('BLOCK' if raw == 1 else 'PASS') != event['action']:
                 violations.append({'kind': 'vm_replay_mismatch', 'hook': event['hook']})
             if stats[0] != int(event['instructions']):
                 violations.append({'kind': 'vm_instruction_mismatch', 'hook': event['hook']})
             if stats[1] != safe_read_count:
                 violations.append({'kind': 'vm_safe_read_count_mismatch', 'hook': event['hook']})
-        return {'violations': violations, 'decisions': decisions, 'observations': observations,
+        return {'violations': violations, 'runtime_diagnostics': runtime_diagnostics,
+                'decisions': decisions, 'observations': observations,
                 'blocks': blocks, 'diagnostics': diagnostics}
 
     def close(self):

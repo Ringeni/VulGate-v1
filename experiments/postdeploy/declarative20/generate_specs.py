@@ -64,8 +64,8 @@ Listen 127.0.0.1:{port}
 ServerName localhost
 ErrorLog {root}/error.log
 LogLevel warn
-User vita
-Group vita
+User {run_user}
+Group {run_group}
 StartServers 1
 ServerLimit 1
 ThreadsPerChild 4
@@ -193,6 +193,91 @@ def _isargs_poc() -> dict[str, Any]:
             {'method': 'GET', 'uri': '/a%25b'},
             {'method': 'GET', 'uri': '/' + ('%25' * 1000)},
         ],
+    }
+
+
+def _rewrite_capture_poc() -> dict[str, Any]:
+    return {
+        'invocation_selector': 'last_before_fault',
+        'requests': [
+            {'method': 'GET', 'uri': '/rewrite/ordinary'},
+            {'method': 'GET', 'uri': '/rewrite/' + ('A' * 1800)},
+        ],
+    }
+
+
+def _regex_capture_poc() -> dict[str, Any]:
+    return {
+        'invocation_selector': 'last_before_fault',
+        'requests': [
+            {'method': 'GET', 'uri': '/map/' + ('a' * 64)},
+            {'method': 'GET', 'uri': '/slice?n=' + ('1' * 200)},
+        ],
+    }
+
+
+def _vhost_long_host_poc() -> dict[str, Any]:
+    return {
+        'invocation_selector': 'last_before_fault',
+        'requests': [{'method': 'GET', 'uri': '/plain.txt', 'headers': {'Host': '.'.join(['ab'] * 80)}}],
+    }
+
+
+def _single_request_poc(method: str, uri: str, headers: dict[str, str] | None = None, body: str | None = None, protocol: str | None = None) -> dict[str, Any]:
+    item: dict[str, Any] = {'method': method, 'uri': uri}
+    if headers:
+        item['headers'] = headers
+    if body is not None:
+        item['body'] = body
+    if protocol:
+        item['protocol'] = protocol
+    return {'invocation_selector': 'last_before_fault', 'requests': [item]}
+
+
+def _php_multipart_body(token: str, progress: bool) -> str:
+    boundary = 'VulGateOrdinaryBoundary20261112'
+    parts = [
+        f'--{boundary}\r\nContent-Disposition: form-data; name="message"\r\n\r\n{token}\r\n',
+    ]
+    if progress:
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="PHP_SESSION_UPLOAD_PROGRESS"\r\n\r\njob\r\n')
+    parts.append(
+        f'--{boundary}\r\nContent-Disposition: form-data; name="document"; filename="note.txt"\r\n'
+        'Content-Type: text/plain\r\n\r\nOrdinary upload data.\r\n'
+    )
+    parts.append(f'--{boundary}--\r\n')
+    return ''.join(parts)
+
+
+def _php_upload_poc(progress: bool) -> dict[str, Any]:
+    headers = {
+        'Content-Type': 'multipart/form-data; boundary=VulGateOrdinaryBoundary20261112',
+        'Cookie': 'PHPSESSID=vgpoc0001',
+    }
+    requests = [{
+        'method': 'POST',
+        'uri': '/',
+        'headers': headers,
+        'body': _php_multipart_body('ordinary-poc', progress),
+        'response_kind': 'json',
+    }]
+    if progress:
+        second = dict(requests[0])
+        second['headers'] = dict(headers)
+        second['headers']['Cookie'] = 'PHPSESSID=vgpoc0002'
+        second['body'] = _php_multipart_body('ordinary-poc-2', True)
+        requests.append(second)
+    return {'invocation_selector': 'all_in_episode' if progress else 'last_before_fault', 'requests': requests}
+
+
+def _brotli_stream_poc() -> dict[str, Any]:
+    return {
+        'invocation_selector': 'last_before_fault',
+        'commands': [
+            {'plain_text': 'A' * 64, 'quality': 11, 'chunk_in': 1, 'chunk_out': 1, 'first_zero': 1},
+            {'plain_text': 'Ordinary functional compression round trip.\n' * 4, 'quality': 5, 'chunk_in': 3, 'chunk_out': 5, 'first_zero': 0},
+        ],
+        'health': {'plain_text': 'healthy brotli round trip\n', 'quality': 5, 'chunk_in': 64, 'chunk_out': 64, 'first_zero': 0},
     }
 
 
@@ -435,6 +520,7 @@ def generate_app_profiles(spec_root: Path) -> dict[str, Path]:
         'symbolic_slice': {
             'include_dirs': [str(php_src / sub) for sub in ('.', 'Zend', 'main', 'TSRM', 'ext')],
             'defines': [],
+            'helper_includes': ['"php.h"', '"SAPI.h"', '"php_globals.h"'],
         },
         'action_catalog': {
             'PHP_MULTIPART_RETURN_VOID': {'kind': 'return_void'},
@@ -511,6 +597,7 @@ def generate_all_20_case_specs(spec_root: Path, profile_paths: dict[str, Path]) 
             },
             'safety_oracle': {'kind': 'physical_memory_safety', 'at': 'sink_site'},
             'environment_fixture': {'transient_maps': ['current_input']},
+            'seed_traces': {'poc_reproducer': _brotli_stream_poc()},
             'symbolization_scope': {
                 'cut_harness_kind': 'brotli_stream_refill',
                 'enable_uninitialized_shadow': True,
@@ -652,7 +739,7 @@ def generate_all_20_case_specs(spec_root: Path, profile_paths: dict[str, Path]) 
                 'symbolic_inputs': [{'name': 'counter'}],
                 'field_to_input_map': {'counter': 'counter'},
             },
-            'budgets': {'loop_unwind': 16, 'max_impact_regions': 4, 'solver_timeout_sec': 90},
+            'budgets': {'loop_unwind': 16, 'max_impact_regions': 4, 'solver_timeout_sec': 90, 'episode_length': 2},
         },
         {
             'schema': 'vulgate.patch/v2',
@@ -794,10 +881,13 @@ def generate_all_20_case_specs(spec_root: Path, profile_paths: dict[str, Path]) 
             },
             'safety_oracle': {'kind': 'state_invariant', 'at': 'sink_site'},
             'environment_fixture': {'config_template': _nginx_conf_template(), 'files': _nginx_std_files()},
-            'seed_traces': {'benign_seeds': _nginx_base_seeds([
-                {'id': 'regex', 'group': 'regex_map', 'method': 'GET', 'path': '/map/ordinary', 'expected_status': 200},
-                {'id': 'slice', 'group': 'slice_range_proxy', 'method': 'GET', 'path': '/slice', 'expected_status': 200},
-            ])},
+            'seed_traces': {
+                'poc_reproducer': _regex_capture_poc(),
+                'benign_seeds': _nginx_base_seeds([
+                    {'id': 'regex', 'group': 'regex_map', 'method': 'GET', 'path': '/map/ordinary', 'expected_status': 200},
+                    {'id': 'slice', 'group': 'slice_range_proxy', 'method': 'GET', 'path': '/slice', 'expected_status': 200},
+                ]),
+            },
             'symbolization_scope': {
                 'slice_sources': [str(ngx_1296_src / 'src/http/ngx_http_variables.c')],
                 'cut_harness_kind': 'nginx_regex_captures',
@@ -853,7 +943,7 @@ def generate_all_20_case_specs(spec_root: Path, profile_paths: dict[str, Path]) 
                     'files': _nginx_std_files(),
                 },
                 'seed_traces': {
-                    **({'poc_reproducer': _isargs_poc()} if cve_id == 'CVE-2026-42945' else {}),
+                    'poc_reproducer': _isargs_poc() if cve_id == 'CVE-2026-42945' else _rewrite_capture_poc(),
                     'benign_seeds': _nginx_base_seeds([
                         {'id': 'rewrite', 'group': 'regex_rewrite', 'method': 'GET', 'path': '/rewrite/ordinary', 'expected_status': 302},
                     ]),
@@ -991,7 +1081,10 @@ def generate_all_20_case_specs(spec_root: Path, profile_paths: dict[str, Path]) 
                 'config_template': _httpd_conf_template('VirtualDocumentRoot {root}/www\n'),
                 'files': _httpd_std_files(),
             },
-            'seed_traces': {'benign_seeds': _httpd_base_seeds()},
+            'seed_traces': {
+                'poc_reproducer': _vhost_long_host_poc(),
+                'benign_seeds': _httpd_base_seeds(),
+            },
             'symbolization_scope': {
                 'cut_harness_kind': 'httpd_vhost_translate',
                 'enable_uninitialized_shadow': True,
@@ -1028,16 +1121,19 @@ def generate_all_20_case_specs(spec_root: Path, profile_paths: dict[str, Path]) 
             },
             'safety_oracle': {'kind': 'state_invariant', 'at': 'sink_site'},
             'environment_fixture': {'config_template': _httpd_conf_template(), 'files': _httpd_std_files()},
-            'seed_traces': {'benign_seeds': _httpd_base_seeds([
-                {'id': 'http2', 'group': 'http2_direct', 'method': 'GET', 'path': '/plain.txt', 'protocol': 'h2', 'expected_status': 200},
-            ])},
+            'seed_traces': {
+                'poc_reproducer': _single_request_poc('GET', '/plain.txt', protocol='h2'),
+                'benign_seeds': _httpd_base_seeds([
+                    {'id': 'http2', 'group': 'http2_direct', 'method': 'GET', 'path': '/plain.txt', 'protocol': 'h2', 'expected_status': 200},
+                ]),
+            },
             'symbolization_scope': {
                 'cut_harness_kind': 'httpd_h2_c1_setup',
                 'enable_uninitialized_shadow': True,
                 'symbolic_inputs': [{'name': 'is_h2'}],
                 'extra_predicates': ['is_h2 == 1'],
             },
-            'budgets': {'loop_unwind': 16, 'max_impact_regions': 4, 'solver_timeout_sec': 90},
+            'budgets': {'loop_unwind': 16, 'max_impact_regions': 4, 'solver_timeout_sec': 90, 'episode_length': 2},
         },
         {
             'schema': 'vulgate.patch/v2',
@@ -1066,7 +1162,14 @@ def generate_all_20_case_specs(spec_root: Path, profile_paths: dict[str, Path]) 
             },
             'safety_oracle': {'kind': 'state_invariant', 'at': 'sink_site'},
             'environment_fixture': {'config_template': _httpd_conf_template(), 'files': _httpd_std_files()},
-            'seed_traces': {'benign_seeds': _httpd_base_seeds([
+            'seed_traces': {
+                'poc_reproducer': _single_request_poc(
+                    'PROPPATCH',
+                    '/dav/file.txt',
+                    headers={'Content-Type': 'application/xml'},
+                    body='<?xml version="1.0"?><D:propertyupdate xmlns:D="DAV:" xmlns:X="urn:ordinary"><D:set><D:prop><X:label>hello</X:label></D:prop></D:set></D:propertyupdate>',
+                ),
+                'benign_seeds': _httpd_base_seeds([
                 {
                     'id': 'proppatch',
                     'group': 'webdav_proppatch',
@@ -1161,9 +1264,12 @@ def generate_all_20_case_specs(spec_root: Path, profile_paths: dict[str, Path]) 
             },
             'safety_oracle': {'kind': 'physical_memory_safety', 'at': 'sink_site'},
             'environment_fixture': {'config_template': _httpd_conf_template(), 'files': _httpd_std_files()},
-            'seed_traces': {'benign_seeds': _httpd_base_seeds([
-                {'id': 'html', 'group': 'xml2enc_html_filter', 'method': 'GET', 'path': '/html', 'expected_status': 200},
-            ])},
+            'seed_traces': {
+                'poc_reproducer': _single_request_poc('GET', '/html'),
+                'benign_seeds': _httpd_base_seeds([
+                    {'id': 'html', 'group': 'xml2enc_html_filter', 'method': 'GET', 'path': '/html', 'expected_status': 200},
+                ]),
+            },
             'symbolization_scope': {
                 'cut_harness_kind': 'httpd_xml2enc_filter',
                 'enable_uninitialized_shadow': True,
@@ -1200,9 +1306,12 @@ def generate_all_20_case_specs(spec_root: Path, profile_paths: dict[str, Path]) 
             },
             'safety_oracle': {'kind': 'physical_memory_safety', 'at': 'sink_site'},
             'environment_fixture': {'config_template': _httpd_conf_template(), 'files': _httpd_std_files()},
-            'seed_traces': {'benign_seeds': _httpd_base_seeds([
-                {'id': 'latin', 'group': 'charset_lite_output', 'method': 'GET', 'path': '/latin.txt', 'expected_status': 200},
-            ])},
+            'seed_traces': {
+                'poc_reproducer': _single_request_poc('GET', '/latin.txt'),
+                'benign_seeds': _httpd_base_seeds([
+                    {'id': 'latin', 'group': 'charset_lite_output', 'method': 'GET', 'path': '/latin.txt', 'expected_status': 200},
+                ]),
+            },
             'symbolization_scope': {
                 'cut_harness_kind': 'httpd_charset_out_filter',
                 'enable_uninitialized_shadow': True,
@@ -1238,9 +1347,12 @@ def generate_all_20_case_specs(spec_root: Path, profile_paths: dict[str, Path]) 
             },
             'safety_oracle': {'kind': 'temporal_object_validity', 'at': 'sink_site'},
             'environment_fixture': {'config_template': _httpd_conf_template(), 'files': _httpd_std_files()},
-            'seed_traces': {'benign_seeds': _httpd_base_seeds([
-                {'id': 'html', 'group': 'proxy_html_comment', 'method': 'GET', 'path': '/html', 'expected_status': 200},
-            ])},
+            'seed_traces': {
+                'poc_reproducer': _single_request_poc('GET', '/html'),
+                'benign_seeds': _httpd_base_seeds([
+                    {'id': 'html', 'group': 'proxy_html_comment', 'method': 'GET', 'path': '/html', 'expected_status': 200},
+                ]),
+            },
             'symbolization_scope': {
                 'cut_harness_kind': 'httpd_proxy_html_comment',
                 'enable_uninitialized_shadow': True,
@@ -1276,9 +1388,12 @@ def generate_all_20_case_specs(spec_root: Path, profile_paths: dict[str, Path]) 
             },
             'safety_oracle': {'kind': 'temporal_object_validity', 'at': 'sink_site'},
             'environment_fixture': {'config_template': _httpd_conf_template(), 'files': _httpd_std_files()},
-            'seed_traces': {'benign_seeds': _httpd_base_seeds([
-                {'id': 'condition', 'group': 'rewrite_cond_var', 'method': 'GET', 'path': '/condition', 'headers': {'User-Agent': 'ordinary'}, 'expected_status': 200},
-            ])},
+            'seed_traces': {
+                'poc_reproducer': _single_request_poc('GET', '/condition', headers={'User-Agent': 'ordinary'}),
+                'benign_seeds': _httpd_base_seeds([
+                    {'id': 'condition', 'group': 'rewrite_cond_var', 'method': 'GET', 'path': '/condition', 'headers': {'User-Agent': 'ordinary'}, 'expected_status': 200},
+                ]),
+            },
             'symbolization_scope': {
                 'cut_harness_kind': 'httpd_rewrite_lookup',
                 'enable_uninitialized_shadow': True,
@@ -1322,6 +1437,7 @@ def generate_all_20_case_specs(spec_root: Path, profile_paths: dict[str, Path]) 
                     {'name': 'no preexisting progress state', 'symbol': 'ps_globals', 'add_offset': int(php_b['baseline']['layout']['progress_offset']), 'expected_symbol': None},
                 ],
             },
+            'seed_traces': {'poc_reproducer': _php_upload_poc(False)},
             'symbolization_scope': {
                 'cut_harness_kind': 'php_multipart_startup',
                 'enable_uninitialized_shadow': True,
@@ -1329,7 +1445,7 @@ def generate_all_20_case_specs(spec_root: Path, profile_paths: dict[str, Path]) 
                 'field_to_input_map': {'activated': 'activated', 'throws': '0', 'uploads': '0'},
                 'extra_predicates': ['is_mp == 1', 'activated == 0'],
             },
-            'budgets': {'loop_unwind': 16, 'max_impact_regions': 6, 'solver_timeout_sec': 90},
+            'budgets': {'loop_unwind': 16, 'max_impact_regions': 6, 'solver_timeout_sec': 90, 'episode_length': 2},
         },
         {
             'schema': 'vulgate.patch/v2',
@@ -1386,6 +1502,7 @@ def generate_all_20_case_specs(spec_root: Path, profile_paths: dict[str, Path]) 
                     {'name': 'no preexisting progress state', 'symbol': 'ps_globals', 'add_offset': int(php_b['baseline']['layout']['progress_offset']), 'expected_symbol': None},
                 ],
             },
+            'seed_traces': {'poc_reproducer': _php_upload_poc(True)},
             'symbolization_scope': {
                 'cut_harness_kind': 'php_session_progress',
                 'enable_uninitialized_shadow': True,
@@ -1431,7 +1548,59 @@ def generate_all_20_case_specs(spec_root: Path, profile_paths: dict[str, Path]) 
     return manifest_rows
 
 
-def run_batch(spec_root: Path, results_root: Path, selected_cases: list[str] | None = None, cbmc: Path | None = None) -> dict[str, Any]:
+def _control_jobs(rows: list[dict[str, Any]]) -> list[tuple[dict[str, Any], Path, str]]:
+    by_id = {row['case_id']: row for row in rows}
+    found: list[tuple[dict[str, Any], Path, str]] = []
+    for base, relative, label in (
+        ('CVE-2026-111497', 'runtime/dsl/patches/CVE-2026-111497-single.vg', 'CVE-2026-111497-single'),
+        ('CVE-2026-93479', 'runtime/dsl/patches_alt/CVE-2026-93479-rewrite.vg', 'CVE-2026-93479-rewrite'),
+        ('CVE-2026-93479', 'runtime/dsl/patches_fine/CVE-2026-93479.vg', 'CVE-2026-93479-fine'),
+    ):
+        dsl = ROOT / relative
+        if base in by_id and dsl.is_file():
+            found.append((by_id[base], dsl, label))
+    return found
+
+
+def _summary_row(label: str, rep: dict[str, Any]) -> dict[str, Any]:
+    cs = rep['correctness_and_safety']
+    pf = rep['path_and_functional_metrics']
+    hooks = pf['hook_triggering']
+    fix = pf['functional_impact_fixed_eval']
+    reg = pf['symbolic_impact_regions']
+    cov = pf['paired_coverage']
+    target = cs['target_vulnerability_elimination']
+    pass_path = cs.get('pass_path_noninterference') or {}
+    pass_status = pass_path.get('status') if isinstance(pass_path, dict) else pass_path
+    return {
+        'case_id': label,
+        'application': rep['application'],
+        'installation': rep['installation']['status'],
+        'vm_equivalence': cs['vm_bytecode_equivalence']['status'],
+        'action_and_caller_continuation': cs['action_and_caller_continuation']['status'],
+        'cut_functions': cs['action_and_caller_continuation'].get('scope', {}).get('cut_functions', []),
+        'target_elimination': target['status'],
+        'cut_local_target': target.get('cut_local_status'),
+        'poc_nonvacuity_on_baseline': target.get('poc_nonvacuity_on_baseline'),
+        'bypass_paths': target.get('bypass_paths', []),
+        'pass_path_noninterference': pass_status,
+        'snapshot_lift': (rep.get('snapshot_lift') or {}).get('mode'),
+        'impact_regions_total': reg['total_regions'],
+        'unchanged_regions': reg['unchanged_regions'],
+        'changed_by_block_regions': reg['changed_by_block_regions'],
+        'fixed_eval_changed': f"{fix['changed_cases']}/{fix['denominator_valid_benign_cases']}",
+        'fixed_eval_changed_fraction': round(fix['changed_fraction'], 4),
+        'vm_decisions': hooks.get('total_vm_decisions', hooks.get('decisions')),
+        'vm_blocks': hooks.get('block_decisions'),
+        'vm_replay_mismatches': hooks.get('vm_replay_mismatches', hooks.get('replay_violations')),
+        'runtime_diagnostics': hooks.get('runtime_diagnostics', hooks.get('diagnostics')),
+        'retained_edge_fraction': cov.get('retained_edge_ratio', cov.get('retained_edge_fraction')),
+        'lost_edges': cov.get('lost_edges_union', cov.get('lost_edge_union')),
+        'elapsed_seconds': round(rep['elapsed_seconds'], 2),
+    }
+
+
+def run_batch(spec_root: Path, results_root: Path, selected_cases: list[str] | None = None, cbmc: Path | None = None, include_controls: bool = False) -> dict[str, Any]:
     spec_root = spec_root.resolve()
     results_root = results_root.resolve()
     results_root.mkdir(parents=True, exist_ok=True)
@@ -1442,51 +1611,32 @@ def run_batch(spec_root: Path, results_root: Path, selected_cases: list[str] | N
         wanted = set(selected_cases)
         rows = [r for r in rows if r['case_id'] in wanted]
 
+    jobs: list[tuple[dict[str, Any], Path | None, str]] = []
+    for row in rows:
+        dsl = ROOT / 'runtime/dsl/patches' / f'{row["case_id"]}.vg'
+        jobs.append((row, dsl if dsl.is_file() else None, row['case_id']))
+    if include_controls:
+        jobs.extend(_control_jobs(rows))
+
     summary_rows = []
     started = time.monotonic()
-    for row in rows:
-        cid = row['case_id']
-        print(f'[evaluate] starting {cid} ({row["app_key"]}) ...', flush=True)
+    for row, dsl, label in jobs:
+        print(f'[evaluate] starting {label} ({row["app_key"]}) ...', flush=True)
         try:
             rep = evaluate_case(
                 Path(row['vuln_spec']),
                 Path(row['patch_spec']),
                 Path(row['app_profile']),
-                results_root / cid,
+                results_root / label,
                 cbmc_bin=cbmc,
+                dsl_patch=dsl,
             )
-            cs = rep['correctness_and_safety']
-            pf = rep['path_and_functional_metrics']
-            fix = pf['functional_impact_fixed_eval']
-            reg = pf['symbolic_impact_regions']
-            cov = pf['paired_coverage']
-            summary_rows.append({
-                'case_id': cid,
-                'application': rep['application'],
-                'installation': rep['installation']['status'],
-                'vm_equivalence': cs['vm_bytecode_equivalence']['status'],
-                'action_and_caller_continuation': cs['action_and_caller_continuation']['status'],
-                'cut_functions': cs['action_and_caller_continuation'].get('scope', {}).get('cut_functions', []),
-                'target_elimination': cs['target_vulnerability_elimination']['status'],
-                'cut_local_target': cs['target_vulnerability_elimination'].get('cut_local_status'),
-                'bypass_paths': cs['target_vulnerability_elimination'].get('bypass_paths', []),
-                'impact_regions_total': reg['total_regions'],
-                'unchanged_regions': reg['unchanged_regions'],
-                'changed_by_block_regions': reg['changed_by_block_regions'],
-                'fixed_eval_changed': f"{fix['changed_cases']}/{fix['denominator_valid_benign_cases']}",
-                'fixed_eval_changed_fraction': round(fix['changed_fraction'], 4),
-                'vm_decisions': pf['hook_triggering']['decisions'],
-                'vm_blocks': pf['hook_triggering']['block_decisions'],
-                'replay_violations': pf['hook_triggering']['replay_violations'],
-                'retained_edge_fraction': cov['retained_edge_fraction'],
-                'lost_edges': cov['lost_edge_union'],
-                'elapsed_seconds': round(rep['elapsed_seconds'], 2),
-            })
+            summary_rows.append(_summary_row(label, rep))
             print(json.dumps(summary_rows[-1], ensure_ascii=False), flush=True)
         except Exception as exc:
             traceback.print_exc()
             summary_rows.append({
-                'case_id': cid,
+                'case_id': label,
                 'status': 'ERROR',
                 'error': str(exc),
             })
@@ -1504,6 +1654,7 @@ if __name__ == '__main__':
     parser.add_argument('--results-out', type=Path, required=True)
     parser.add_argument('--cases', nargs='*', default=None)
     parser.add_argument('--cbmc', type=Path, default=None)
+    parser.add_argument('--include-controls', action='store_true')
     args = parser.parse_args()
-    run_batch(args.specs_out, args.results_out, args.cases, args.cbmc)
+    run_batch(args.specs_out, args.results_out, args.cases, args.cbmc, args.include_controls)
 
