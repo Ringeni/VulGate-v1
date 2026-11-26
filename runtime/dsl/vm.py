@@ -500,6 +500,7 @@ class VMMount:
     action_id: str | None
     nature: str = 'intercept'
     locals: list[dict] = None
+    flag_repair: dsl_parser.FlagRepairSpec | None = None
 
 
 @dataclass
@@ -581,6 +582,11 @@ def compile_patch(patch: dsl_parser.PatchSpec,
     state = MapState(patch.maps)
     mounts: list[VMMount] = []
     for mount in patch.mounts:
+        if mount.flag_repair is not None:
+            mounts.append(VMMount(mount.id, mount.module, mount.symbol, mount.offset,
+                                  list(mount.args), mount.return_type, b'', None,
+                                  'repair_point', flag_repair=mount.flag_repair))
+            continue
         read_point = mount.nature in ('\u8bfb\u53d6\u70b9', 'read_point')
         nature = 'read_point' if read_point else 'intercept'
         if read_point:

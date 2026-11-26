@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 import json
 import os
 from pathlib import Path
@@ -42,6 +43,13 @@ def _target_address(pid: int | None, mount: dsl_parser.MountSpec,
     if info is None:
         raise ValueError('cannot find module for mount ' + mount.id)
     module, base, path = info
+    if mount.flag_repair is not None:
+        binary = Path(f'/proc/{pid}/exe') if pid is not None else path
+        if not binary.samefile(path):
+            raise ValueError('repair_point target is not the running executable: ' + mount.id)
+        actual_id = dsl_resolve.frida_symbols.build_id(binary)
+        if actual_id != mount.build_id:
+            raise ValueError(f'{mount.id}: expected Build ID {mount.build_id}, found {actual_id}')
     if mount.offset is None:
         offsets = dsl_resolve.frida_symbols.symbol_offsets(path, [mount.symbol])
         if mount.symbol not in offsets:
@@ -64,17 +72,18 @@ def _script(patch: dsl_parser.PatchSpec, compiled: dsl_vm.VMPatch,
             targets: list[tuple[int, str | None]], bridge: Path) -> str:
     entries = []
     for mount, target in zip(compiled.mounts, targets):
+        flag_repair = asdict(mount.flag_repair) if mount.flag_repair is not None else None
         if mount.action_id is None:
             action_expr = 'undefined'
         else:
             action_expr = _action_value(patch.actions[mount.action_id])
         entries.append(
             '{id: %s, args: %s, return_type: %s, target: %s, code: %s, '
-            'action: %s, nature: %s, locals: %s}' % (
+            'action: %s, nature: %s, locals: %s, flag_repair: %s}' % (
                 json.dumps(mount.id), json.dumps(mount.args),
                 json.dumps(mount.return_type), json.dumps(hex(target[0])),
                 json.dumps(list(mount.code)), action_expr,
-                json.dumps(mount.nature), json.dumps(mount.locals)))
+                json.dumps(mount.nature), json.dumps(mount.locals), json.dumps(flag_repair)))
     mounts_literal = '[' + ', '.join(entries) + ']'
     capacities = [int(item['capacity']) for item in compiled.maps]
     map_literal = json.dumps({'count': len(capacities),
@@ -134,8 +143,51 @@ function vg_store_local(target, slot, value) {
   else target.add(slot * 8).writeU64(value);
 }
 
+function vg_install_flag_repair(spec) {
+  const target = ptr(spec.target);
+  const range = Process.findRangeByAddress(target);
+  if (range === null || !range.protection.includes('x')) {
+    throw new Error('repair_point needs an executable address: ' + spec.id);
+  }
+  const repair = spec.flag_repair;
+  const atInstruction = typeof repair.base === 'string';
+  if (atInstruction && Process.arch !== 'x64') {
+    throw new Error('instruction repair requires x86-64: ' + spec.id);
+  }
+  function applyRepair(callArgs) {
+    VG_HITS[spec.id] = (VG_HITS[spec.id] || 0) + 1;
+    try {
+      const base = atInstruction ? this.context[repair.base] : callArgs[repair.base];
+      const source = repair.source_register === null ? null : this.context[repair.source_register];
+      if (base.isNull() || (source !== null && source.isNull())) {
+        VG_RUN[spec.id] = 'repair-skipped-null';
+        return;
+      }
+      const address = base.add(repair.offset);
+      const before = address.readU8();
+      let bits = repair.operation === 'set' ? repair.mask : 0;
+      if (source !== null) bits = source.add(repair.source_offset).readU8() & repair.mask;
+      const after = (before & ~repair.mask) | bits;
+      if (after === before) {
+        VG_RUN[spec.id] = 'repair-unneeded';
+        return;
+      }
+      address.writeU8(after);
+      VG_RUN[spec.id] = 'repaired';
+    } catch (error) {
+      VG_RUN[spec.id] = 'repair-error: ' + error;
+    }
+  }
+  const listener = Interceptor.attach(target, atInstruction ? applyRepair : { onEnter: applyRepair });
+  VG_STATE.push({id: spec.id, target: String(target), nature: spec.nature, listener: listener});
+}
+
 function vg_install() {
   for (const spec of VG_MOUNTS) {
+    if (spec.flag_repair !== null) {
+      vg_install_flag_repair(spec);
+      continue;
+    }
     const code = Memory.alloc(spec.code.length);
     code.writeByteArray(spec.code);
     const handle = create(code, spec.code.length);
@@ -199,34 +251,38 @@ rpc.exports = {
 
 
 def install(patch_path: Path, pid: int | None, executable: Path | None,
-            bridge_dir: Path, duration: float = 5.0, spawn=False) -> dict:
+            bridge_dir: Path, duration: float = 5.0, spawn=False,
+            spawn_args: list[str] | None = None) -> dict:
     patch = dsl_parser.load(patch_path)
+    if not spawn and any(mount.requires_spawn for mount in patch.mounts):
+        raise ValueError('this patch requires --spawn before application configuration is compiled')
+    if spawn_args and not spawn:
+        raise ValueError('spawn arguments require --spawn')
     import frida
     device = frida.get_local_device()
-    if spawn:
-        pid = device.spawn([str(executable.resolve())])
-    assert pid is not None
-    dsl_resolve.resolve_patch(patch, pid=pid, executable=executable)
-    globals_ = {}
-    for name in _global_names(patch):
-        module, address = dsl_resolve.resolve_global(
-            name, pid, None, executable)
-        globals_[name] = address
-    compiled = dsl_vm.compile_patch(patch, globals_)
-    targets = []
-    for mount in patch.mounts:
-        targets.append(_target_address(pid, mount, executable))
-    bridge = _bridge(bridge_dir)
     session = None
+    spawned_pid = None
     try:
+        if spawn:
+            spawned_pid = device.spawn([str(executable.resolve()), *(spawn_args or [])])
+            pid = spawned_pid
+        assert pid is not None
+        dsl_resolve.resolve_patch(patch, pid=pid, executable=executable)
+        globals_ = {}
+        for name in _global_names(patch):
+            _, address = dsl_resolve.resolve_global(name, pid, None, executable)
+            globals_[name] = address
+        compiled = dsl_vm.compile_patch(patch, globals_)
+        targets = [_target_address(pid, mount, executable) for mount in patch.mounts]
+        bridge = _bridge(bridge_dir)
         session = device.attach(pid)
         script = session.create_script(_script(patch, compiled, targets, bridge))
         if os.environ.get('VG_DEBUG'):
             script.on('message', lambda message, data: print('VG_SCRIPT', message, flush=True))
         script.load()
         result = script.exports_sync.install()
-        if spawn:
-            device.resume(pid)
+        if spawned_pid is not None:
+            device.resume(spawned_pid)
         time.sleep(max(0.0, duration))
         result['final'] = script.exports_sync.status()
         return result
@@ -236,9 +292,9 @@ def install(patch_path: Path, pid: int | None, executable: Path | None,
                 session.detach()
             except Exception:
                 pass
-        if spawn:
+        if spawned_pid is not None:
             try:
-                device.kill(pid)
+                device.kill(spawned_pid)
             except Exception:
                 pass
 
@@ -249,11 +305,12 @@ def main() -> int:
     target = parser.add_mutually_exclusive_group(required=True)
     target.add_argument('--pid', type=int)
     target.add_argument('--spawn', type=Path)
+    parser.add_argument('--spawn-arg', action='append', default=[])
     parser.add_argument('--duration', type=float, default=5.0)
     parser.add_argument('--bridge-dir', type=Path, default=ROOT / 'build' / 'frida-vm')
     args = parser.parse_args()
     result = install(args.dsl, args.pid, args.spawn, args.bridge_dir,
-                     args.duration, spawn=args.spawn is not None)
+                     args.duration, spawn=args.spawn is not None, spawn_args=args.spawn_arg)
     print(json.dumps(result, ensure_ascii=False))
     return 0
 

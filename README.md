@@ -506,6 +506,8 @@ patched:  result=0, error=-9, produced=0
 
 ## 4. 选用的 20 个漏洞补丁
 
+细粒度候选、Shadow VM 回归用例和安装核对项见 [细粒度 DSL 补丁与安装交接](runtime/dsl/patches_fine/README.md)。
+
 当前 `runtime/dsl/patches/` 中选了以下 20 个 CVE：
 
 | # | 漏洞 | 应用 | 挂载函数 | 当前验证状态 |
@@ -560,6 +562,8 @@ CVE-2026-42945 / CVE-2026-9256:
 ```
 
 这是有意的语义降级，不等于原始字段写补丁。
+
+`patches_fine/CVE-2026-42945.vg` 另提供一个 `repair_point`，在已核对的 nginx 构建上清除正则结束时的 `is_args` 标志，再继续原函数。安装器在挂载前比对 ELF Build ID。[安装条件与验证](runtime/dsl/patches_fine/README.md)
 
 ---
 

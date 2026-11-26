@@ -1,0 +1,71 @@
+name: Linux application acceptance
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/linux-acceptance.yml
+      - runtime/**
+      - tests/acceptance/**
+      - deploy/backports/**
+      - requirements-frida.txt
+
+permissions:
+  contents: read
+
+jobs:
+  nginx:
+    name: nginx 9256
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    container:
+      image: debian:bookworm
+      options: --cap-add=SYS_PTRACE
+    steps:
+      - name: Install build and runtime dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl git gcc libc6-dev binutils python3 python3-venv libcrypt1 libpcre2-8-0 libssl3 zlib1g
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Extract the pinned nginx binary and install Frida
+        run: |
+          curl --fail --silent --show-error --location --retry 3 --max-time 120 \
+            'https://nginx.org/packages/mainline/debian/pool/nginx/n/nginx/nginx_1.31.0-1~bookworm_amd64.deb' \
+            --output /tmp/nginx-1.31.0.deb
+          printf '%s  %s\n' 5b63cff5abc6491ce41d07c01165834a3b20dc2eb4322df499304a4aa7f3f2e0 /tmp/nginx-1.31.0.deb | sha256sum --check
+          dpkg-deb --extract /tmp/nginx-1.31.0.deb /tmp/nginx-package
+          python3 -m venv /tmp/vulgate-venv
+          /tmp/vulgate-venv/bin/python -m pip install -r requirements-frida.txt
+      - name: Exercise real nginx before and after mounting the patch
+        run: |
+          /tmp/vulgate-venv/bin/python tests/acceptance/nginx_9256.py /tmp/nginx-package/usr/sbin/nginx --report /tmp/nginx-9256.json
+          cat /tmp/nginx-9256.json
+          { printf '```json\n'; cat /tmp/nginx-9256.json; printf '\n```\n'; } >> "$GITHUB_STEP_SUMMARY"
+
+  apache:
+    name: Apache 63292
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    container: debian:bookworm
+    steps:
+      - name: Install Apache build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates git build-essential binutils autoconf automake libtool libtool-bin libapr1-dev libaprutil1-dev libpcre2-dev pkg-config python3
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Fetch and identify the Apache release sources
+        run: |
+          git init /tmp/httpd-source
+          git -C /tmp/httpd-source fetch --depth=1 https://github.com/apache/httpd.git tag 2.4.68 tag 2.4.69
+          test "$(git -C /tmp/httpd-source rev-parse '2.4.68^{commit}')" = 736bb657405eb73fd68a64772c3a908807bdb887
+          test "$(git -C /tmp/httpd-source rev-parse '2.4.69^{commit}')" = 1e06e9860794ce39605b79a0a787abfe084e5677
+      - name: Verify, rebuild, and load the Apache backport
+        run: |
+          python3 deploy/backports/verify_cve_2026_63292.py /tmp/httpd-source
+          python3 tests/acceptance/apache_63292.py --source /tmp/httpd-source --report /tmp/apache-63292.json
+          cat /tmp/apache-63292.json
+          { printf '```json\n'; cat /tmp/apache-63292.json; printf '\n```\n'; } >> "$GITHUB_STEP_SUMMARY"

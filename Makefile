@@ -13,7 +13,7 @@ build-vm:
 test: test-dsl
 
 test-dsl:
-	$(PYTEST) tests/test_dsl.py tests/test_dsl_vm.py tests/test_dsl_resolve.py tests/test_dsl_x86.py
+	$(PYTEST) tests/test_dsl.py tests/test_dsl_fine.py tests/test_dsl_vm.py tests/test_dsl_resolve.py tests/test_dsl_x86.py
 
 clean:
 	rm -rf build
